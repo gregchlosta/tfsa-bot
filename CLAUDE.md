@@ -2,6 +2,8 @@
 
 Personal trading assistant for one Wealthsimple TFSA (Core plan). Started Nov 2026 with ~$2k, will scale to ~$20k if forward results hold up. The owner places trades manually; the bot gives signals via CLI, the Claude app (MCP) and notifications.
 
+**Signals only.** The bot outputs target % per ETF and what changed since last week. It never asks for or stores balances, deposits or fills (the owner removed that in Nov 2026 and tracks holdings in their own Claude chats). Don't add account tracking or dollar sizing back.
+
 ## Goal
 Beat buy-and-hold (XEQT/VFV) after costs, with smaller drawdowns, using ONE simple strategy. If it can't, the honest answer is "hold the index", and the bot should say so.
 
@@ -20,12 +22,12 @@ Beat buy-and-hold (XEQT/VFV) after costs, with smaller drawdowns, using ONE simp
 - Backtest and paper replay share execution rules: decide at the close, execute at the next close, 10 bps per leg.
 - Signals use completed daily closes only (`engine.completed_returns` drops today's partial bar).
 - Canadian ETF history is spliced with US proxies converted to CAD (`data.py`); proxies carry an annual drag for MER and withholding tax.
-- State lives in `data/` (git-ignored): `tfsa.db` (decisions, assessments, trades, deposits, runs), `config.json`, price caches.
+- State lives in `data/` (git-ignored): `tfsa.db` (decisions, assessments, runs), `config.json`, price caches.
 - News LLM: `claude-opus-5-5`, strict JSON schema, server-side fallbacks, effort medium, ~$0.045/call. Headlines are untrusted input; the schema plus the reduce-only overlay bound the damage.
 - MCP: `mcp` 2.x (`MCPServer`, not FastMCP). Schedule: launchd plist written by `install.py`. The API key is read from `~/.zshrc` by `bin/run-cycle.sh`.
 
 ## Working on it
-- `uv run pytest` must pass; tests are offline. Add tests for any change to strategy, overlay, portfolio or paper.
+- `uv run pytest` must pass; tests are offline. Add tests for any change to strategy, overlay, btc, signal changes or paper.
 - Re-run `uv run tfsa-bot research` after any strategy or data change and compare against the numbers above.
 - Don't write to the real `data/tfsa.db` in experiments; monkeypatch `db.DB_PATH` as the tests do.
 

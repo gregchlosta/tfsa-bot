@@ -1,4 +1,4 @@
-"""SQLite store: decisions per track, news assessments, your real trades and deposits, run log."""
+"""SQLite store: decisions per track, news assessments, run log. No account data: the bot only gives signals."""
 
 import json
 import sqlite3
@@ -12,11 +12,9 @@ CONFIG_PATH = DATA_DIR / "config.json"
 
 DEFAULT_CONFIG = {
     "follow": "core",  # "core" (backtested) or "overlay" (core + news check, once it has proven itself)
-    "default_capital": 2000,
     "use_llm": True,
     "ntfy_topic": None,  # set to a private random string to get phone pushes via ntfy.sh
-    "min_trade_dollars": 25,
-    "btc_share": 0.0,  # share of the account in the Bitcoin pot (btc.py); 0 = off
+    "btc_share": 0.0,  # share of the portfolio in the Bitcoin pot (btc.py); 0 = off
 }
 
 SCHEMA = """
@@ -25,10 +23,6 @@ CREATE TABLE IF NOT EXISTS decisions (
   PRIMARY KEY (track, as_of));
 CREATE TABLE IF NOT EXISTS assessments (
   id INTEGER PRIMARY KEY, created_at TEXT, as_of TEXT, stress TEXT, llm TEXT, headlines TEXT, model TEXT);
-CREATE TABLE IF NOT EXISTS trades (
-  id INTEGER PRIMARY KEY, date TEXT, ticker TEXT, shares REAL, price REAL, note TEXT);
-CREATE TABLE IF NOT EXISTS cashflows (
-  id INTEGER PRIMARY KEY, date TEXT, amount REAL, note TEXT);
 CREATE TABLE IF NOT EXISTS runs (
   id INTEGER PRIMARY KEY, created_at TEXT, summary TEXT);
 """
@@ -93,29 +87,6 @@ def latest_assessment(with_llm: bool = True) -> dict | None:
     if not r:
         return None
     return {**dict(r), **{k: json.loads(r[k]) for k in ("stress", "llm", "headlines")}}
-
-
-# --- your real account -----------------------------------------------------
-
-def add_trade(date: str, ticker: str, shares: float, price: float, note: str = "") -> None:
-    with connect() as con:
-        con.execute("INSERT INTO trades (date,ticker,shares,price,note) VALUES (?,?,?,?,?)",
-                    (date, ticker, shares, price, note))
-
-
-def add_cashflow(date: str, amount: float, note: str = "") -> None:
-    with connect() as con:
-        con.execute("INSERT INTO cashflows (date,amount,note) VALUES (?,?,?)", (date, amount, note))
-
-
-def trades() -> list[dict]:
-    with connect() as con:
-        return [dict(r) for r in con.execute("SELECT * FROM trades ORDER BY date, id")]
-
-
-def cashflows() -> list[dict]:
-    with connect() as con:
-        return [dict(r) for r in con.execute("SELECT * FROM cashflows ORDER BY date, id")]
 
 
 def save_run(summary: dict) -> None:

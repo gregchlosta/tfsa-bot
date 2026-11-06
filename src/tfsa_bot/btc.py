@@ -1,4 +1,4 @@
-"""Bitcoin pot: a fixed share of the account that is either all FBTC.TO (trend up) or all CASH.TO.
+"""Bitcoin pot: a fixed share of the portfolio that is either all FBTC.TO (trend up) or all CASH.TO.
 
 Rule, checked once a week after Friday's close (same score the core strategy uses for every sleeve):
   IN  when Bitcoin's average 1/3/6/12-month return beats cash (score > 0), else OUT (cash).
@@ -7,8 +7,9 @@ No stop-loss: in the backtest 20%/25%/30% stops gave -5%, -8% and +7% CAGR vs no
 The pot sits on top of the unchanged core strategy, which keeps its own 15% Bitcoin cap, so
 total Bitcoin can reach pot share + 15% x (1 - pot share).
 
-Between flips the pot is not rebalanced every week (that would mean a small trade every
-Friday). It is pulled back to its target share only when it drifts more than `band` away.
+The live signal always shows the pot at its full share. In the backtest the pot is pulled
+back to its share only when it drifts more than `band` away (not a small trade every Friday);
+do the same when you rebalance by hand.
 
 Monitoring between weekly checks is information only: the flip price says how far Bitcoin
 would have to fall (or rise) for the score to cross zero. Acting on it mid-week would be a

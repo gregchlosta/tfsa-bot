@@ -10,7 +10,7 @@ from typing import Literal
 from mcp.server.mcpserver import MCPServer
 
 from . import backtest as bt
-from . import db, engine, news, paper, portfolio
+from . import db, engine, news, paper
 from . import stress as stress_mod
 from .data import build_returns, load_raw, total_return_index
 from .strategy import Params, scores, universe_keys
@@ -19,23 +19,23 @@ from .universe import BY_KEY, SLEEVES
 server = MCPServer(
     name="tfsa-bot",
     instructions=(
-        "Personal trading assistant for a Wealthsimple TFSA running ONE weekly trend-following strategy "
-        "on CAD-listed ETFs. Typical flow: call get_brief to see the target allocation and the exact trades; "
-        "the user places trades manually in Wealthsimple, then call log_trade for each fill (and log_deposit "
-        "for money added) so the account stays in sync. The news check is a shadow layer being forward-tested; "
-        "the recommendation follows the backtested core unless settings say otherwise. If btc_share > 0, that "
-        "share of the account is a Bitcoin pot that is either all FBTC or all cash on a weekly trend rule "
-        "(bitcoin_status explains it); mid-week moves are information only. Never invent prices or "
-        "fills: use what tools return or what the user tells you. This is a rules-based system, not "
-        "financial advice; present its output, its caveats, and the backtest evidence plainly."
+        "Signal service for a Wealthsimple TFSA running ONE weekly trend-following strategy on CAD-listed ETFs. "
+        "It only gives signals: target % per ETF and what changed since last week. It does not know the user's "
+        "balance or trades and must never ask for them; the user tracks their own holdings in this chat. If the "
+        "user shares their holdings, you can turn the percentages into trades for them. Call get_brief for the "
+        "current signal. The news check is a shadow layer being forward-tested; the signal follows the "
+        "backtested core unless settings say otherwise. If btc_share > 0, that share of the portfolio is a "
+        "Bitcoin pot that is either all FBTC or all cash on a weekly trend rule (bitcoin_status explains it); "
+        "mid-week moves are information only. Never invent prices: use what tools return. This is a rules-based "
+        "system, not financial advice; present its output, its caveats, and the backtest evidence plainly."
     ),
 )
 
 
 @server.tool()
 def get_brief(refresh_news: bool = False) -> dict:
-    """Current recommendation: target allocation, exact trades vs the logged account, stress gauge, and the
-    latest news check. refresh_news=True pulls headlines and runs a new Claude assessment (~cents, ~30-60s);
+    """Current signal: target % per ETF, what changed since last week's signal, stress gauge, Bitcoin pot,
+    and the latest news check. refresh_news=True pulls headlines and runs a new Claude assessment (~cents, ~30-60s);
     otherwise the latest stored assessment is reused."""
     s = engine.run_cycle(refresh=False, with_news=refresh_news, send=False)
     return {"text": engine.brief_text(s), "data": s}
@@ -70,34 +70,6 @@ def bitcoin_status() -> dict:
 
 
 @server.tool()
-def get_portfolio() -> dict:
-    """The user's real account as reconstructed from logged trades and deposits, valued at latest prices."""
-    raw = load_raw()
-    st = portfolio.state(raw.ffill().iloc[-1])
-    st["trades"] = db.trades()[-20:]
-    st["deposits"] = db.cashflows()
-    return st
-
-
-@server.tool()
-def log_trade(ticker: str, side: Literal["BUY", "SELL"], shares: float, price: float, date: str | None = None, note: str = "") -> dict:
-    """Record a fill the user executed in Wealthsimple. shares is positive; side sets the sign. price in CAD
-    per share. date as YYYY-MM-DD (default today). Tickers like 'ZEB' or 'ETHX.B' are normalized."""
-    tk = portfolio.record_trade(ticker, side, shares, price, date, note)
-    out = get_portfolio()
-    if tk not in portfolio.TICKER_TO_KEY:
-        out["warning"] = f"{tk} is not in the strategy universe; it is tracked but valued at 0 without a price."
-    return out
-
-
-@server.tool()
-def log_deposit(amount: float, date: str | None = None, note: str = "") -> dict:
-    """Record cash moved into the TFSA (negative amount = withdrawal)."""
-    db.add_cashflow(date or portfolio.today(), amount, note)
-    return get_portfolio()
-
-
-@server.tool()
 def market_news(topics: list[str] | None = None) -> dict:
     """Raw recent headlines (Google News, ~48h) plus the price-based stress gauge, without any AI judgement.
     topics: sleeve keys, e.g. ["ca_banks","btc"]; default = everything in the universe."""
@@ -110,13 +82,9 @@ def market_news(topics: list[str] | None = None) -> dict:
 
 @server.tool()
 def performance() -> dict:
-    """Forward test since the bot started: core strategy vs core+news-check vs XEQT-like buy-and-hold,
-    plus the real account's gain vs deposits."""
-    rets = build_returns()
-    out = paper.report(rets)
-    out["account"] = get_portfolio()
-    out["account"].pop("trades", None)
-    return out
+    """Forward test since the bot started (paper tracks of the signals): core strategy vs core+news-check vs
+    XEQT-like buy-and-hold, and the Bitcoin pot vs holding Bitcoin."""
+    return paper.report(build_returns())
 
 
 @server.tool()
@@ -141,7 +109,6 @@ def run_backtest(
 @server.tool()
 def update_settings(
     follow: Literal["core", "overlay"] | None = None,
-    default_capital: float | None = None,
     use_llm: bool | None = None,
     ntfy_topic: str | None = None,
     btc_share: float | None = None,
@@ -151,7 +118,7 @@ def update_settings(
     if btc_share is not None and not 0 <= btc_share <= 1:
         raise ValueError("btc_share must be between 0 and 1")
     cfg = db.config()
-    for k, v in {"follow": follow, "default_capital": default_capital, "use_llm": use_llm, "ntfy_topic": ntfy_topic,
+    for k, v in {"follow": follow, "use_llm": use_llm, "ntfy_topic": ntfy_topic,
                  "btc_share": btc_share}.items():
         if v is not None:
             cfg[k] = v

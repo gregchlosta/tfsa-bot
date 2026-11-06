@@ -1,10 +1,10 @@
-"""Offline tests on synthetic data: strategy rules, overlay guarantees, orders, paper replay."""
+"""Offline tests on synthetic data: strategy rules, overlay guarantees, signal changes, paper replay."""
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from tfsa_bot import db, overlay, paper, portfolio
+from tfsa_bot import db, overlay, paper
 from tfsa_bot.strategy import Params, target_weights, universe_keys
 
 KEYS = universe_keys(Params()) + ["cash"]
@@ -68,31 +68,15 @@ def test_overlay_rules():
     assert w["ca_eq"] == pytest.approx(0.125)  # existing holding halved by flag
 
 
-def test_normalize_ticker():
-    assert portfolio.normalize_ticker("zeb") == "ZEB.TO"
-    assert portfolio.normalize_ticker("ETHX.B") == "ETHX-B.TO"
-    assert portfolio.normalize_ticker("AAPL") == "AAPL"
-
-
-def test_account_state_and_orders():
-    prices = pd.Series({"ZEB.TO": 80.0, "XIC.TO": 50.0, "CASH.TO": 50.0, "XIT.TO": 60.0})
-    db.add_cashflow("2026-01-01", 1000)
-    portfolio.record_trade("ZEB", "BUY", 5, 80.0, "2026-01-02")
-    portfolio.record_trade("XIT.TO", "BUY", 2, 50.0, "2026-01-02")
-    portfolio.record_trade("MYSTERY", "BUY", 1, 10.0, "2026-01-02")  # unknown ticker, no price
-    st = portfolio.state(prices)
-    assert st["cash"] == pytest.approx(1000 - 400 - 100 - 10)
-    assert st["total"] == pytest.approx(490 + 400 + 120)  # mystery valued at 0
-    target = pd.Series({"ca_banks": 0.5, "ca_eq": 0.5, "cash": 0.0})
-    orders = {(o["side"], o["ticker"]) for o in portfolio.orders(target, st, prices, 0, 25)}
-    assert ("SELL", "XIT.TO") in orders  # strategy no longer wants it
-    assert ("BUY", "XIC.TO") in orders
-    assert all(o[1] != "MYSTERY" for o in orders)  # never trades things outside the strategy
-
-
-def test_orders_zero_capital():
-    st = {"has_account": False, "positions": [], "total": 0}
-    assert portfolio.orders(pd.Series({"ca_eq": 1.0}), st, pd.Series({"XIC.TO": 50.0}), 0, 25) == []
+def test_signal_changes():
+    from tfsa_bot.engine import signal_changes
+    prev = pd.Series({"ca_eq": 0.25, "ca_banks": 0.25, "gold": 0.25, "cash": 0.25})
+    now = pd.Series({"ca_eq": 0.25, "gold": 0.125, "btc": 0.5, "cash": 0.125})
+    ch = {c["ticker"]: c["action"] for c in signal_changes(prev, now)}
+    assert ch == {"ZEB.TO": "SELL", "CGL-C.TO": "DECREASE", "CASH.TO": "DECREASE", "FBTC.TO": "BUY"}
+    assert signal_changes(prev, prev + 0.01) == []  # small drifts aren't changes
+    order = [c["action"] for c in signal_changes(prev, now)]
+    assert order.index("SELL") < order.index("BUY")  # sells first, so the cash is there
 
 
 def test_paper_replay_executes_next_day():

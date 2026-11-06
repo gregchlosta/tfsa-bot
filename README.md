@@ -20,13 +20,16 @@ uv run tfsa-bot install-schedule      # run Mon–Fri 9:45, 12:30, 16:45 with no
 ## Usage
 
 ```
-uv run tfsa-bot brief                         # what to hold, what to trade
-uv run tfsa-bot deposit 2000                  # log money added
-uv run tfsa-bot log-trade BUY ZEB 6.42 77.86  # log a fill
-uv run tfsa-bot performance                   # forward test vs buy-and-hold
+uv run tfsa-bot brief                         # the signal: % per ETF, changes since last week
+uv run tfsa-bot btc                           # Bitcoin pot: signal, flip price, trend
+uv run tfsa-bot btc-share 0.5                 # Bitcoin pot size (0 = off)
+uv run tfsa-bot performance                   # forward test (paper) vs buy-and-hold
 uv run tfsa-bot research                      # full backtest report
 uv run pytest                                 # tests
 ```
+
+The bot only gives signals (percentages). It never asks for your balance or trades; turn the
+percentages into orders yourself, or ask Claude in the app with your holdings.
 
 Settings are in `data/config.json`.
 
