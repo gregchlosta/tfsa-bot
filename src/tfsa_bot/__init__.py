@@ -11,6 +11,9 @@ def main() -> None:
     rn.add_argument("--quiet", action="store_true", help="no notifications")
     sub.add_parser("brief", help="show recommendation using cached data and the latest news check")
     sub.add_parser("performance", help="forward-test results")
+    sub.add_parser("btc", help="Bitcoin pot: weekly signal, live score, flip price, trend")
+    bs = sub.add_parser("btc-share", help="set the Bitcoin pot's share of the account (0 = off)")
+    bs.add_argument("share", type=float, help="e.g. 0.5 for 50%%")
     lt = sub.add_parser("log-trade", help="record a fill")
     lt.add_argument("side", choices=["BUY", "SELL", "buy", "sell"])
     lt.add_argument("ticker")
@@ -40,6 +43,18 @@ def main() -> None:
         from .data import build_returns
         from .paper import report
         print(json.dumps(report(build_returns()), indent=2))
+    elif args.cmd == "btc":
+        from . import engine
+        s = engine.run_cycle(refresh=True, with_news=False, send=False)
+        print(engine.btc_text(s["btc"]) if s["btc"] else "Bitcoin pot is off. Turn it on: tfsa-bot btc-share 0.5")
+    elif args.cmd == "btc-share":
+        from . import db
+        if not 0 <= args.share <= 1:
+            raise SystemExit("share must be between 0 and 1")
+        cfg = db.config()
+        cfg["btc_share"] = args.share
+        db.save_config(cfg)
+        print(f"Bitcoin pot set to {args.share:.0%} of the account. Run `tfsa-bot brief` for the trades.")
     elif args.cmd == "log-trade":
         from . import portfolio
         tk = portfolio.record_trade(args.ticker, args.side, args.shares, args.price, args.date)

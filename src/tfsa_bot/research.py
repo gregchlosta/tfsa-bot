@@ -8,8 +8,9 @@ from dataclasses import replace
 import pandas as pd
 
 from . import backtest as bt
+from . import btc
 from .data import build_returns
-from .strategy import Params
+from .strategy import Params, target_weights
 
 START = "2006-01-01"  # leaves 1y warm-up after data starts (late 2004)
 FMT = {
@@ -34,6 +35,15 @@ def benchmarks(rets, start=START, end=None) -> dict[str, dict]:
         "BENCH XBAL-like (60/40)": bt.run(rets, bt.fixed(bt.XBAL_LIKE), **kw).stats,
         "BENCH VFV only (S&P 500)": bt.run(rets, bt.fixed(bt.VFV_ONLY), **kw).stats,
     }
+
+
+def btc_pot_fn(p: Params, share: float, follow_trend: bool = True):
+    """Account = core on (1 - share) + Bitcoin pot on `share`; same functions as the live engine."""
+    def fn(tri, current):
+        core = target_weights(tri, p, btc.core_view(current, share))
+        on = btc.is_in(tri) if follow_trend else True
+        return btc.combine(core, on, share, float(current.get("btc", 0.0)))
+    return fn
 
 
 def main() -> None:
@@ -93,7 +103,17 @@ def main() -> None:
 
     print("=== 6. How often each asset was held (default) ===")
     held = (res.weights > 1e-6).mean().sort_values(ascending=False)
-    print((held * 100).round(0).astype(int).astype(str).add("%").to_string())
+    print((held * 100).round(0).astype(int).astype(str).add("%").to_string(), "\n")
+
+    print("=== 7. Bitcoin pot on top of the core (from 2015-09, first date with 12m of Bitcoin) ===")
+    bs = "2015-09-01"
+    rows = {"core only (pot off)": bt.run(rets, bt.strategy_fn(base), start=bs).stats}
+    for share in (0.25, 0.5):
+        rows[f"{share:.0%} pot, weekly trend rule"] = bt.run(rets, btc_pot_fn(base, share), start=bs).stats
+        rows[f"{share:.0%} pot, always Bitcoin"] = bt.run(rets, btc_pot_fn(base, share, False), start=bs).stats
+    rows.update(benchmarks(rets, bs))
+    print(table(rows))
+    print("Bitcoin's 2015-2021 gains (from a tiny base) dominate these numbers; don't expect them again.")
 
 
 if __name__ == "__main__":

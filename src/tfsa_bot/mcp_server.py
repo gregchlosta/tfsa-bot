@@ -23,7 +23,9 @@ server = MCPServer(
         "on CAD-listed ETFs. Typical flow: call get_brief to see the target allocation and the exact trades; "
         "the user places trades manually in Wealthsimple, then call log_trade for each fill (and log_deposit "
         "for money added) so the account stays in sync. The news check is a shadow layer being forward-tested; "
-        "the recommendation follows the backtested core unless settings say otherwise. Never invent prices or "
+        "the recommendation follows the backtested core unless settings say otherwise. If btc_share > 0, that "
+        "share of the account is a Bitcoin pot that is either all FBTC or all cash on a weekly trend rule "
+        "(bitcoin_status explains it); mid-week moves are information only. Never invent prices or "
         "fills: use what tools return or what the user tells you. This is a rules-based system, not "
         "financial advice; present its output, its caveats, and the backtest evidence plainly."
     ),
@@ -54,6 +56,17 @@ def explain_ranking() -> dict:
         r = {f"{lb}d": round(float(t[k].iloc[-1] / t[k].iloc[-1 - lb] - 1), 4) for lb in p.lookbacks}
         rows.append({"ticker": BY_KEY[k].ticker, "name": BY_KEY[k].name, "score": round(float(v), 4), **r})
     return {"signal_date": str(week.date()), "rules": "hold top 4 with score > 0, 25% each; crypto capped (BTC 15%, ETH 10%)", "ranking": rows}
+
+
+@server.tool()
+def bitcoin_status() -> dict:
+    """Bitcoin pot: weekly IN/OUT signal, live score, 1/3/6/12-month returns vs cash, how far Bitcoin would
+    have to move to flip the signal (and the FBTC price), distance from the 200-day average and the 3-year high.
+    The signal only changes on Friday's close; this cannot predict Bitcoin."""
+    s = engine.run_cycle(refresh=False, with_news=False, send=False)
+    if not s["btc"]:
+        return {"enabled": False, "note": "btc_share is 0. Set it with update_settings(btc_share=0.5)."}
+    return {"enabled": True, "text": engine.btc_text(s["btc"]), "data": s["btc"]}
 
 
 @server.tool()
@@ -131,11 +144,15 @@ def update_settings(
     default_capital: float | None = None,
     use_llm: bool | None = None,
     ntfy_topic: str | None = None,
+    btc_share: float | None = None,
 ) -> dict:
     """Change settings. follow='overlay' makes recommendations include the news check (only once the
-    forward test supports it)."""
+    forward test supports it). btc_share = share of the account in the Bitcoin pot (0-1, 0 = off)."""
+    if btc_share is not None and not 0 <= btc_share <= 1:
+        raise ValueError("btc_share must be between 0 and 1")
     cfg = db.config()
-    for k, v in {"follow": follow, "default_capital": default_capital, "use_llm": use_llm, "ntfy_topic": ntfy_topic}.items():
+    for k, v in {"follow": follow, "default_capital": default_capital, "use_llm": use_llm, "ntfy_topic": ntfy_topic,
+                 "btc_share": btc_share}.items():
         if v is not None:
             cfg[k] = v
     db.save_config(cfg)

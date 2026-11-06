@@ -6,17 +6,18 @@
    (core = backtested strategy, overlay = core + news check). Mid-week, news can only cut
    overlay positions.
 4. Build YOUR recommendation (follows config 'follow') and the exact trades vs your account.
-5. Notify when there's something to do.
+5. Bitcoin pot (config 'btc_share' > 0): that share of the account follows btc.py's weekly
+   in/out rule; the rest follows the recommendation above.
+6. Notify when there's something to do.
 """
 
-import os
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 from . import backtest as bt
-from . import db, news, notify, overlay, paper, portfolio
+from . import btc, db, news, notify, overlay, paper, portfolio
 from . import stress as stress_mod
 from .data import build_returns, load_raw, total_return_index
 from .strategy import Params, scores, target_weights, universe_keys
@@ -70,11 +71,13 @@ def run_cycle(refresh: bool = True, with_news: bool = True, use_llm: bool | None
 
     acct = portfolio.state(prices)
     acct_w = portfolio.current_weights(acct)
+    share = float(cfg.get("btc_share") or 0.0)
+    core_acct_w = btc.core_view(acct_w, share)
     core_pw = paper.current_weights(rets, "core")
     ov_pw = paper.current_weights(rets, "overlay")
     stress = stress_mod.snapshot(raw, rets.index)
     ranking = scores(tri_w[universe_keys(p) + ["cash"]], p).sort_values(ascending=False)
-    core_now = target_weights(tri_w, p, acct_w if acct_w is not None else core_pw)
+    core_now = target_weights(tri_w, p, core_acct_w if acct_w is not None else core_pw)
 
     # --- news ---------------------------------------------------------------
     llm, err, heads = None, None, []
@@ -83,7 +86,7 @@ def run_cycle(refresh: bool = True, with_news: bool = True, use_llm: bool | None
     if with_news:
         heads = news.headlines(relevant)
         want_llm = cfg["use_llm"] if use_llm is None else use_llm
-        if want_llm and os.environ.get("ANTHROPIC_API_KEY"):
+        if want_llm and news.ensure_api_key():
             ctx = {
                 "held": {BY_KEY[k].ticker: v for k, v in _w(acct_w if acct_w is not None else ov_pw).items()},
                 "targets": {BY_KEY[k].ticker: v for k, v in _w(core_now).items()},
@@ -122,14 +125,33 @@ def run_cycle(refresh: bool = True, with_news: bool = True, use_llm: bool | None
             w["cash"] = 1 - w.drop("cash").sum()
             db.save_decision("overlay", as_of.date().isoformat(), _w(w), [f"{k}: mid-week cut (news)" for k in cut])
 
+    # Bitcoin pot paper track (recorded every week, also while btc_share is 0, so there's a forward record)
+    btc_new_week = not any(d["as_of"] == week_s for d in db.decisions("btc"))
+    if btc_new_week:
+        db.save_decision("btc", week_s, {"btc": 1.0} if btc.is_in(tri_w) else {"cash": 1.0})
+
     # --- your recommendation -----------------------------------------------
     rec, rec_notes = core_now, []
     if cfg["follow"] == "overlay":
-        rec, rec_notes = overlay.apply(core_now, acct_w, risk, flags)
+        rec, rec_notes = overlay.apply(core_now, core_acct_w, risk, flags)
     elif acct_w is None:
         last = db.decisions("core")
         rec = pd.Series(last[-1]["weights"]) if last else core_now
-    shadow, shadow_notes = overlay.apply(rec, acct_w, risk, flags)
+    shadow, shadow_notes = overlay.apply(rec, core_acct_w, risk, flags)
+
+    # --- Bitcoin pot -----------------------------------------------------------
+    btc_info = None
+    if share > 0:
+        btc_on = bool(db.decisions("btc")[-1]["weights"].get("btc"))
+        cur_btc = float(acct_w.get("btc", 0.0)) if acct_w is not None else None
+        rec = btc.combine(rec, btc_on, share, cur_btc)
+        px = prices.get(BY_KEY["btc"].ticker)
+        btc_info = {
+            "share": share, "new_week": btc_new_week, "weekly_signal": "IN" if btc_on else "OUT",
+            "weekly": btc.status(tri_w, None),
+            "now": btc.status(tri, None if px is None or pd.isna(px) else round(float(px), 2)),
+            "total_btc_weight": round(float(rec.get("btc", 0.0)), 4),
+        }
     orders = portfolio.orders(rec, acct, prices, cfg["default_capital"], cfg["min_trade_dollars"])
 
     summary = {
@@ -143,14 +165,16 @@ def run_cycle(refresh: bool = True, with_news: bool = True, use_llm: bool | None
         "news_check_would_change": shadow_notes if cfg["follow"] == "core" else [],
         "orders": orders,
         "account": acct,
+        "btc": btc_info,
     }
+    prev_run = db.last_run() or {}
     db.save_run(summary)
     if send:
-        _maybe_notify(summary, prev)
+        _maybe_notify(summary, prev, prev_run)
     return summary
 
 
-def _maybe_notify(s: dict, prev_llm: dict | None) -> None:
+def _maybe_notify(s: dict, prev_llm: dict | None, prev_run: dict | None = None) -> None:
     msgs = []
     now = datetime.now(TZ)
     monday_morning = now.weekday() == 0 and now.hour < 11
@@ -166,6 +190,16 @@ def _maybe_notify(s: dict, prev_llm: dict | None) -> None:
             msgs.append((f"Market risk: {n['market_risk'].upper()}", n["summary"][:200]))
         for f in new_flags:
             msgs.append((f"News flag: {BY_KEY[f['sleeve']].ticker} {f['action']}", f["reason"][:200]))
+    b = s.get("btc")
+    if b:
+        prev_now = (((prev_run or {}).get("btc") or {}).get("now") or {}).get("signal")
+        decs = db.decisions("btc")
+        if b["new_week"]:
+            if len(decs) > 1 and bool(decs[-1]["weights"].get("btc")) != bool(decs[-2]["weights"].get("btc")):
+                msgs.append((f"Bitcoin pot: {b['weekly_signal']}", "Weekly Bitcoin signal flipped. Trades are in the brief."))
+        elif b["now"]["signal"] and b["now"]["signal"] != b["weekly_signal"] and b["now"]["signal"] != prev_now:
+            msgs.append(("Bitcoin heads-up", f"If the week closed now, the Bitcoin pot would go {b['now']['signal']}. "
+                         "Nothing to do until Friday's close confirms it."))
     for title, body in msgs:
         notify.send(title, body)
 
@@ -196,4 +230,25 @@ def brief_text(s: dict) -> str:
         L.append(f"  (news: {s['news_error']})")
     if s["news_check_would_change"]:
         L.append("  Shadow overlay would: " + "; ".join(s["news_check_would_change"]))
+    if s.get("btc"):
+        L.append("\n" + btc_text(s["btc"]))
+    return "\n".join(L)
+
+
+def btc_text(b: dict) -> str:
+    w, n = b["weekly"], b["now"]
+    pct = lambda v: "n/a" if v is None else f"{v:+.1%}"
+    L = [f"BITCOIN POT ({b['share']:.0%} of account): {b['weekly_signal']} "
+         f"({'FBTC.TO' if b['weekly_signal'] == 'IN' else 'CASH.TO'}) — weekly score {w['score']:+.3f}"]
+    L.append(f"  Total Bitcoin in target incl. core strategy: {b['total_btc_weight']:.0%}")
+    L.append("  Returns 1/3/6/12m: " + ", ".join(pct(v) for v in n["windows"].values())
+             + "  (cash: " + ", ".join(pct(v) for v in n["cash_windows"].values()) + ")")
+    flip = n.get("flip_move")
+    if flip is not None:
+        word = "drop" if flip < 0 else "rise"
+        at = f" (FBTC ≈ ${n['flip_price_fbtc']})" if n.get("flip_price_fbtc") else ""
+        L.append(f"  Live score {n['score']:+.3f} -> would be {n['signal']}. Flips on a {abs(flip):.0%} {word}{at}.")
+    L.append(f"  vs 200-day average {pct(n['vs_200d_avg'])}, from 3-year high {pct(n['from_3y_high'])}")
+    if n["signal"] != b["weekly_signal"]:
+        L.append("  HEADS-UP: live score disagrees with the weekly signal. Act only if Friday's close confirms.")
     return "\n".join(L)

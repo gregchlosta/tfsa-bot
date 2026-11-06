@@ -12,6 +12,7 @@ Beat buy-and-hold (XEQT/VFV) after costs, with smaller drawdowns, using ONE simp
 - **Stress gauge is information only.** It was backtested as a gate (block new buys) and cost 0.5–1.5%/yr.
 - **News check is a shadow track.** Recommendations follow `core`; the `overlay` paper track records what the news check would have done. Switch `follow` to `overlay` in `data/config.json` only after ~3+ months, and only if it's ahead on both return and drawdown (`tfsa-bot performance`).
 - **Overlay can only reduce risk** (block new entries, halve positions). Never let it add risk; a test enforces this.
+- **Bitcoin pot** (`btc.py`, `btc_share` in config; owner chose 50% in Nov 2026): that share is all FBTC or all CASH.TO, flipped weekly on the core's own momentum score for Bitcoin. The core underneath is unchanged (keeps its 15% cap). Backtest from 2015-09 (`research` §7): 50% pot with the rule 47% CAGR / -47% max DD vs always-Bitcoin 48% / -58%; returns are inflated by 2015-21. Stop-losses (20/25/30%) were tested and gave noise (-5/-8/+7% CAGR), so none. Mid-week monitoring (live score, flip price) is information only.
 - **Trading frequency stays low** (weekly, ~10–13 trades/yr): avoids CRA "business income" risk in a TFSA.
 
 ## Architecture

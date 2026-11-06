@@ -6,7 +6,11 @@ strict JSON schema; it needs ANTHROPIC_API_KEY. Cost is roughly a few cents per 
 """
 
 import json
+import os
+import re
+import shlex
 import urllib.parse
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -17,6 +21,27 @@ import anthropic
 from .universe import BY_KEY, SLEEVES
 
 MODEL = "claude-opus-5-5"
+
+
+def ensure_api_key(rc: Path = Path.home() / ".zshrc") -> bool:
+    """Make ANTHROPIC_API_KEY available even when we weren't started from a shell (launchd, the Claude
+    app's MCP launcher). Reads only the `export ANTHROPIC_API_KEY=...` line from ~/.zshrc; never logs it."""
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return True
+    try:
+        text = rc.read_text()
+    except OSError:
+        return False
+    for line in text.splitlines():
+        m = re.match(r"\s*export\s+ANTHROPIC_API_KEY=(.+)$", line)
+        if m:
+            try:
+                val = shlex.split(m.group(1), comments=True)
+            except ValueError:
+                continue
+            if val and val[0]:
+                os.environ["ANTHROPIC_API_KEY"] = val[0]
+    return bool(os.environ.get("ANTHROPIC_API_KEY"))
 
 GLOBAL_QUERIES = [
     "stock market today",

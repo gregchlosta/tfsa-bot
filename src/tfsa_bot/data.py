@@ -3,7 +3,9 @@
 import io
 import time
 import urllib.request
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -17,8 +19,21 @@ CASH_CACHE = DATA_DIR / "cad_tbill.pkl"
 CACHE_MAX_AGE_H = 6
 
 
-def _fresh(path: Path) -> bool:
-    return path.exists() and (time.time() - path.stat().st_mtime) < CACHE_MAX_AGE_H * 3600
+TZ = ZoneInfo("America/Toronto")
+CLOSE_FINAL = (16, 30)  # Toronto time; matches engine.completed_returns
+
+
+def _fresh(path: Path, now: datetime | None = None) -> bool:
+    """Cache is fresh if younger than CACHE_MAX_AGE_H AND it wasn't saved before today's close while it's
+    now after the close. Otherwise a pre-close snapshot would be treated as the completed daily bar."""
+    if not path.exists():
+        return False
+    now = now or datetime.now(TZ)
+    saved = datetime.fromtimestamp(path.stat().st_mtime, TZ)
+    if (now - saved).total_seconds() >= CACHE_MAX_AGE_H * 3600:
+        return False
+    close = now.replace(hour=CLOSE_FINAL[0], minute=CLOSE_FINAL[1], second=0, microsecond=0)
+    return not (now.weekday() < 5 and saved < close <= now)
 
 
 def _all_tickers() -> list[str]:

@@ -16,6 +16,7 @@ DEFAULT_CONFIG = {
     "use_llm": True,
     "ntfy_topic": None,  # set to a private random string to get phone pushes via ntfy.sh
     "min_trade_dollars": 25,
+    "btc_share": 0.0,  # share of the account in the Bitcoin pot (btc.py); 0 = off
 }
 
 SCHEMA = """
