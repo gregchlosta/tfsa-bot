@@ -14,7 +14,6 @@ DEFAULT_CONFIG = {
     "follow": "core",  # "core" (backtested) or "overlay" (core + news check, once it has proven itself)
     "use_llm": True,
     "ntfy_topic": None,  # set to a private random string to get phone pushes via ntfy.sh
-    "btc_share": 0.0,  # share of the portfolio in the Bitcoin pot (btc.py); 0 = off
 }
 
 SCHEMA = """

@@ -4,7 +4,7 @@ Tracks:
   core     - the backtested strategy, exactly as specified
   overlay  - core + news/sentiment check (the part that can't be backtested)
   bench    - XEQT-like buy-and-hold from the same start date
-  btc      - the Bitcoin pot on its own (FBTC or cash, weekly), vs holding Bitcoin throughout
+  btc      - the Bitcoin trend signal (FBTC or cash, weekly), vs holding Bitcoin throughout
 The question this answers after a few months: does the news check earn its keep?
 """
 
@@ -64,7 +64,7 @@ def report(rets: pd.DataFrame) -> dict:
     eq, w = replay(rets, db.decisions("btc"))
     if len(eq):
         hold = (1 + rets["btc"].fillna(0).loc[eq.index[0]:]).cumprod()
-        out["btc_pot"] = {"since": eq.index[0].date().isoformat(), "return": round(eq.iloc[-1] - 1, 4),
+        out["btc_signal"] = {"since": eq.index[0].date().isoformat(), "return": round(eq.iloc[-1] - 1, 4),
                           "max_drawdown": round(float((eq / eq.cummax() - 1).min()), 4),
                           "holding": "FBTC" if w.get("btc", 0) > 0.5 else "cash",
                           "bitcoin_held_throughout": round(float(hold.iloc[-1] / hold.iloc[0] - 1), 4)}

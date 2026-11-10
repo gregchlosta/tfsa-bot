@@ -11,9 +11,9 @@ def main() -> None:
     rn.add_argument("--quiet", action="store_true", help="no notifications")
     sub.add_parser("brief", help="show the signal using cached data and the latest news check")
     sub.add_parser("performance", help="forward-test results")
-    sub.add_parser("btc", help="Bitcoin pot: weekly signal, live score, flip price, trend")
-    bs = sub.add_parser("btc-share", help="set the Bitcoin pot's share of the portfolio (0 = off)")
-    bs.add_argument("share", type=float, help="e.g. 0.5 for 50%%")
+    sub.add_parser("btc", help="Bitcoin trend signal: weekly IN/OUT, flip price, indicator panel, cycle clock")
+    sg = sub.add_parser("signal", help="trend signal for one asset: a universe ETF or any Yahoo Finance ticker")
+    sg.add_argument("ticker")
     sub.add_parser("mcp", help="run the MCP server (stdio)")
     sub.add_parser("install-schedule", help="install macOS launchd job (weekdays 09:45, 12:30, 16:45)")
     sub.add_parser("uninstall-schedule", help="remove the launchd job")
@@ -24,28 +24,23 @@ def main() -> None:
         from .research import main as research
         research()
     elif args.cmd in ("run", "brief"):
-        from . import engine
+        from . import engine, report
         if args.cmd == "run":
             s = engine.run_cycle(refresh=True, use_llm=False if args.no_llm else None, send=not args.quiet)
         else:
             s = engine.run_cycle(refresh=False, with_news=False, send=False)
-        print(engine.brief_text(s))
+        print(report.brief_text(s))
     elif args.cmd == "performance":
         from .data import build_returns
         from .paper import report
         print(json.dumps(report(build_returns()), indent=2))
     elif args.cmd == "btc":
-        from . import engine
-        s = engine.run_cycle(refresh=True, with_news=False, send=False)
-        print(engine.btc_text(s["btc"]) if s["btc"] else "Bitcoin pot is off. Turn it on: tfsa-bot btc-share 0.5")
-    elif args.cmd == "btc-share":
-        from . import db
-        if not 0 <= args.share <= 1:
-            raise SystemExit("share must be between 0 and 1")
-        cfg = db.config()
-        cfg["btc_share"] = args.share
-        db.save_config(cfg)
-        print(f"Bitcoin pot set to {args.share:.0%} of the portfolio. Run `tfsa-bot brief` for the signal.")
+        from . import engine, report
+        m = engine.load_market(refresh=True)
+        print(report.btc_text(engine.bitcoin_report(m, engine.Params())))
+    elif args.cmd == "signal":
+        from . import engine, report
+        print(report.signal_text(engine.asset_report(engine.load_market(), args.ticker)))
     elif args.cmd == "mcp":
         from .mcp_server import main as mcp_main
         mcp_main()

@@ -56,6 +56,16 @@ def load_raw(refresh: bool = False) -> pd.DataFrame:
     return df
 
 
+def load_ticker(ticker: str) -> pd.Series:
+    """Adjusted daily closes for any Yahoo Finance ticker (not cached): for one-off signal lookups."""
+    df = yf.Ticker(ticker).history(period="5y", auto_adjust=True)
+    if df.empty:
+        raise ValueError(f"no price history for {ticker!r} on Yahoo Finance")
+    s = df["Close"].dropna()
+    s.index = pd.to_datetime(s.index).tz_localize(None).normalize()
+    return s
+
+
 def load_cad_tbill(refresh: bool = False) -> pd.Series:
     """Canadian 3-month T-bill yield (annual %, monthly) from FRED."""
     if not refresh and _fresh(CASH_CACHE):

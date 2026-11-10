@@ -1,33 +1,31 @@
-"""Bitcoin pot: a fixed share of the portfolio that is either all FBTC.TO (trend up) or all CASH.TO.
+"""Bitcoin trend signal: IN (hold FBTC.TO) or OUT (cash), checked once a week after Friday's close.
 
-Rule, checked once a week after Friday's close (same score the core strategy uses for every sleeve):
-  IN  when Bitcoin's average 1/3/6/12-month return beats cash (score > 0), else OUT (cash).
-No stop-loss: in the backtest 20%/25%/30% stops gave -5%, -8% and +7% CAGR vs no stop, i.e. noise.
+Rule = the same score the core strategy uses for every ETF: IN when Bitcoin's average
+1/3/6/12-month return beats cash (score > 0). `research` section 8 tested the alternatives
+(faster scores, moving averages, checking daily): none beat it. Faster rules got in ~25 points
+closer to the low but lost more to false starts. No stop-loss: 20%/25%/30% stops gave -5%, -8%
+and +7% CAGR vs no stop, i.e. noise.
 
-The pot sits on top of the unchanged core strategy, which keeps its own 15% Bitcoin cap, so
-total Bitcoin can reach pot share + 15% x (1 - pot share).
+The bot doesn't size anything: how much goes into Bitcoin is decided outside it.
 
-The live signal always shows the pot at its full share. In the backtest the pot is pulled
-back to its share only when it drifts more than `band` away (not a small trade every Friday);
-do the same when you rebalance by hand.
-
-Monitoring between weekly checks is information only: the flip price says how far Bitcoin
-would have to fall (or rise) for the score to cross zero. Acting on it mid-week would be a
-different, untested strategy.
+Everything besides the weekly signal is information only: the flip price (how far Bitcoin has to
+move for the score to cross zero), the indicator panel and the cycle clock. The cycle clock
+reports where we are after the last halving and what followed the same point in earlier cycles.
+That is three cycles, so it is a description, not evidence; it never changes the signal.
 """
 
-import numpy as np
 import pandas as pd
 
-from .strategy import Params, scores
+from . import signals
+from .strategy import Params
 
-BAND = 0.10  # rebalance the pot back to its share only beyond +-10 points of drift
+# Block-reward halvings (UTC dates).
+HALVINGS = tuple(pd.Timestamp(d) for d in ("2012-11-28", "2016-07-09", "2020-05-11", "2024-04-20"))
 
 
 def score(tri: pd.DataFrame, p: Params = Params()) -> float | None:
     """Core momentum score for Bitcoin at the last row of `tri` (None if < 12 months of history)."""
-    sc = scores(tri[["btc", "cash"]], p)
-    return float(sc["btc"]) if "btc" in sc else None
+    return signals.score(tri, "btc", p.lookbacks)
 
 
 def is_in(tri: pd.DataFrame, p: Params = Params()) -> bool:
@@ -35,71 +33,59 @@ def is_in(tri: pd.DataFrame, p: Params = Params()) -> bool:
     return s is not None and s > 0
 
 
-def flip_level(tri: pd.DataFrame, p: Params = Params()) -> float | None:
-    """Bitcoin total-return index level at which the score would be exactly 0 today.
-
-    score(P) = mean_l(P / P_l - 1 - cash_l)  is linear in today's level P, so
-    P* = (1 + mean_l cash_l) / mean_l(1 / P_l).  Divide by today's level for a % move.
-    """
-    if len(tri) < max(p.lookbacks) + 1:
+def cycle_clock(tri: pd.DataFrame, horizons: tuple[int, ...] = (63, 126, 252)) -> dict | None:
+    """Where Bitcoin is in the halving cycle, and what it did from the same day-count after
+    earlier halvings (returns in CAD over the next ~3/6/12 months of trading days)."""
+    b = tri["btc"].dropna()
+    today = b.index[-1]
+    past = [h for h in HALVINGS if h <= today]
+    if not past:
         return None
-    b, c = tri["btc"], tri["cash"]
-    past = np.array([b.iloc[-1 - lb] for lb in p.lookbacks])
-    cash = np.array([c.iloc[-1] / c.iloc[-1 - lb] - 1 for lb in p.lookbacks])
-    return float((1 + cash.mean()) / np.mean(1 / past))
-
-
-def combine(core: pd.Series, on: bool, share: float, current_btc: float | None = None,
-            band: float = BAND) -> pd.Series:
-    """Account target = core strategy on (1 - share) + Bitcoin pot on `share`.
-
-    `current_btc` = Bitcoin weight held now (whole account). If the pot is IN and was IN, and the
-    holding is within `band` of where it should be, keep the current amount instead of trimming.
-    """
-    w = core.astype(float) * (1 - share)
-    for k in ("btc", "cash"):
-        if k not in w:
-            w[k] = 0.0
-    pot_btc = share if on else 0.0
-    if on and current_btc is not None:
-        held_pot = current_btc - w["btc"]  # part of the current holding that belongs to the pot
-        if held_pot > 0 and abs(held_pot - share) <= band:
-            pot_btc = min(held_pot, 1 - w.drop("cash").sum())
-    w["btc"] += pot_btc
-    w["cash"] = 1.0 - w.drop("cash").sum()
-    return w
-
-
-def core_view(current: pd.Series | None, share: float) -> pd.Series | None:
-    """What the core strategy 'holds' once the pot's Bitcoin is set aside (for its hysteresis)."""
-    if current is None or share <= 0:
-        return current
-    cur = current.copy()
-    if "btc" in cur:
-        cur["btc"] = max(0.0, float(cur["btc"]) - share)
-    return cur
-
-
-def status(tri: pd.DataFrame, price: float | None, p: Params = Params()) -> dict:
-    """Snapshot for the CLI / MCP: signal, windows, flip price, trend and drawdown."""
-    s = score(tri, p)
-    b, c = tri["btc"], tri["cash"]
-    lvl = float(b.iloc[-1])
-    flip = flip_level(tri, p)
-    ma200 = float(b.iloc[-200:].mean()) if len(b) >= 200 else None
-    peak = float(b.iloc[-756:].max())  # ~3 years: covers the current cycle's high
+    last = past[-1]
+    days = (today - last).days
+    cyc = b.loc[last:]
+    high_d = cyc.idxmax()
+    after = cyc.loc[high_d:]
+    low_d = after.idxmin()
     out = {
-        "signal": None if s is None else ("IN" if s > 0 else "OUT"),
-        "score": None if s is None else round(s, 4),
-        "windows": {f"{lb}d": round(float(b.iloc[-1] / b.iloc[-1 - lb] - 1), 4)
-                    for lb in p.lookbacks if len(b) > lb},
-        "cash_windows": {f"{lb}d": round(float(c.iloc[-1] / c.iloc[-1 - lb] - 1), 4)
-                         for lb in p.lookbacks if len(c) > lb},
-        "flip_move": None if flip is None else round(flip / lvl - 1, 4),
-        "vs_200d_avg": None if ma200 is None else round(lvl / ma200 - 1, 4),
-        "from_3y_high": round(lvl / peak - 1, 4),
-        "fbtc_price": price,
+        "last_halving": last.date().isoformat(),
+        "days_since_halving": days,
+        "cycle_high_date": high_d.date().isoformat(),
+        "days_since_cycle_high": (today - high_d).days,
+        "from_cycle_high": round(float(b.iloc[-1] / cyc.max() - 1), 4),
+        "low_since_high_date": low_d.date().isoformat(),
+        "low_since_high": round(float(after.min() / cyc.max() - 1), 4),
+        "above_that_low": round(float(b.iloc[-1] / after.min() - 1), 4),
+        "same_point_in_earlier_cycles": [],
+        "note": "Three past cycles at most: a description, not evidence. It never changes the signal.",
     }
-    if flip is not None and price:
-        out["flip_price_fbtc"] = round(price * flip / lvl, 2)
+    for h in past[:-1]:
+        t = h + pd.Timedelta(days=days)
+        if t < b.index[0]:
+            continue
+        i = int(b.index.searchsorted(t))
+        if i >= len(b):
+            continue
+        row = {
+            "halving": h.date().isoformat(),
+            "date": b.index[i].date().isoformat(),
+            # only when our history covers that whole cycle
+            "from_cycle_high": round(float(b.iloc[i] / b.loc[h:b.index[i]].max() - 1), 4) if b.index[0] <= h else None,
+            "next": {f"{n}d": round(float(b.iloc[i + n] / b.iloc[i] - 1), 4) for n in horizons if i + n < len(b)},
+        }
+        out["same_point_in_earlier_cycles"].append(row)
+    return out
+
+
+def status(tri_w: pd.DataFrame, tri: pd.DataFrame, p: Params = Params(),
+           close: float | None = None, usd_close: float | None = None) -> dict:
+    """Snapshot for the CLI / MCP: the generic asset signal for Bitcoin plus the cycle clock.
+
+    `close` = FBTC price and `usd_close` = BTC-USD price at tri's last row (for flip prices)."""
+    out = signals.asset_signal(tri_w, tri, "btc", p, close)
+    flip = out["latest"]["flip_move"]
+    if usd_close and flip is not None:
+        out["latest"]["btc_usd"] = round(float(usd_close))
+        out["latest"]["flip_price_btc_usd"] = round(float(usd_close) * (1 + flip), -2)
+    out["cycle"] = cycle_clock(tri)
     return out

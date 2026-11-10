@@ -4,8 +4,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from tfsa_bot import db, overlay, paper
-from tfsa_bot.strategy import Params, target_weights, universe_keys
+from tfsa_bot import btc, db, overlay, paper, signals
+from tfsa_bot.strategy import Params, scores, target_weights, universe_keys
 
 KEYS = universe_keys(Params()) + ["cash"]
 
@@ -69,7 +69,7 @@ def test_overlay_rules():
 
 
 def test_signal_changes():
-    from tfsa_bot.engine import signal_changes
+    from tfsa_bot.signals import signal_changes
     prev = pd.Series({"ca_eq": 0.25, "ca_banks": 0.25, "gold": 0.25, "cash": 0.25})
     now = pd.Series({"ca_eq": 0.25, "gold": 0.125, "btc": 0.5, "cash": 0.125})
     ch = {c["ticker"]: c["action"] for c in signal_changes(prev, now)}
@@ -122,53 +122,154 @@ def test_price_cache_stale_after_close(tmp_path):
     assert not data._fresh(f, now=wed(23, 0))    # older than max age
 
 
-# --- Bitcoin pot -------------------------------------------------------------
+# --- per-asset signals ----------------------------------------------------------
+
+LB = Params().lookbacks
+UP5 = {"ca_banks": 0.003, "ca_energy": 0.0025, "gold": 0.002, "us_eq": 0.0015, "intl": 0.001}
+
+
+def test_signal_score_is_the_strategy_score():
+    tri = make_tri(UP5)
+    sc = scores(tri, Params())
+    for k in sc.index:
+        assert signals.score(tri, k, LB) == pytest.approx(sc[k], abs=1e-12)
+        assert signals.score_history(tri, k, LB).iloc[-1] == pytest.approx(sc[k], abs=1e-12)
+    assert signals.score(make_tri({}, days=100), "gold", LB) is None  # under 12 months of history
+
+
+def test_flip_level_makes_score_zero():
+    tri = make_tri({"btc": 0.003})
+    lvl = signals.flip_level(tri, "btc", LB)
+    assert lvl < tri["btc"].iloc[-1]  # trending up: it takes a drop to flip
+    at_flip = tri.copy()
+    at_flip.iloc[-1, at_flip.columns.get_loc("btc")] = lvl
+    assert signals.score(at_flip, "btc", LB) == pytest.approx(0.0, abs=1e-12)
+
+
+def test_indicators_agree_in_a_steady_uptrend_and_flip_moves_are_exact():
+    tri = make_tri({"gold": 0.002})
+    ind = {i["name"]: i for i in signals.indicators(tri, "gold")}
+    assert set(ind) == set(signals.ROLES) and all(i["state"] == "UP" for i in ind.values())
+    assert ind["ma50_above_ma200"]["flip_move"] is None  # not flippable by today's price
+    for name in ("trend_score", "fast_score", "above_100d", "above_200d"):
+        moved = tri.copy()
+        moved.iloc[-1, moved.columns.get_loc("gold")] *= 1 + ind[name]["flip_move"]
+        again = {i["name"]: i for i in signals.indicators(moved, "gold")}
+        assert again[name]["value"] == pytest.approx(0.0, abs=2e-4)  # flip_move is rounded to 4 decimals
+    flat = {i["name"]: i["state"] for i in signals.indicators(make_tri({}, days=150), "gold")}
+    assert flat["trend_score"] is None and flat["above_200d"] is None and flat["above_100d"] is not None
+
+
+def test_streak_counts_weeks_since_the_last_flip():
+    idx = pd.bdate_range("2023-01-02", periods=500)
+    r = np.where(np.arange(500) < 440, 0.002, -0.02)  # long rise, then 60 days of falling
+    tri = pd.DataFrame({"x": (1 + r).cumprod(), "cash": 1.0}, index=idx)
+    since, weeks = signals.streak(tri, "x")
+    hist = signals.score_history(tri, "x", LB)
+    flip_day = hist[hist > 0].index[-1]
+    assert 0 < weeks < 12 and pd.Timestamp(since) > flip_day
+    assert pd.Timestamp(since) - flip_day <= pd.Timedelta(days=7)
+    assert signals.streak(tri.iloc[:440], "x")[1] > 30  # before the fall: UP since history allows a score
+
+
+def test_asset_signal_weekly_vs_latest_and_flip_price():
+    tri = make_tri({"gold": 0.002})
+    a = signals.asset_signal(tri.iloc[:-3], tri, "gold", close=50.0)
+    assert a["weekly"]["as_of"] == tri.index[-4].date().isoformat()
+    assert a["latest"]["as_of"] == tri.index[-1].date().isoformat()
+    assert a["weekly"]["state"] == "UP" and a["weekly"]["weeks"] >= 1
+    assert a["latest"]["flip_price"] == pytest.approx(50.0 * (1 + a["latest"]["flip_move"]), abs=0.01)
+    assert a["indicators_up"] == a["indicators_known"] == 5
+    assert a["latest"]["returns"]["252d"] > a["cash_returns"]["252d"]
+
+
+# --- Bitcoin signal -------------------------------------------------------------
 
 def test_btc_signal_in_when_trending_out_when_flat():
-    from tfsa_bot import btc
     assert btc.is_in(make_tri({"btc": 0.003}))
     assert not btc.is_in(make_tri({}))  # flat Bitcoin doesn't beat cash
     assert btc.score(make_tri({}, days=100)) is None  # under 12 months of history
 
 
-def test_btc_flip_level_makes_score_zero():
-    from tfsa_bot import btc
+def test_btc_status_adds_usd_flip_price_and_cycle():
     tri = make_tri({"btc": 0.003})
-    lvl = btc.flip_level(tri)
-    assert lvl < tri["btc"].iloc[-1]  # trending up: it takes a drop to flip
-    at_flip = tri.copy()
-    at_flip.iloc[-1, at_flip.columns.get_loc("btc")] = lvl
-    assert btc.score(at_flip) == pytest.approx(0.0, abs=1e-12)
+    s = btc.status(tri, tri, close=40.0, usd_close=100_000.0)
+    assert s["weekly"]["state"] == "UP"
+    assert s["latest"]["flip_price_btc_usd"] == pytest.approx(100_000 * (1 + s["latest"]["flip_move"]), abs=50)
+    assert s["cycle"]["last_halving"] == "2024-04-20"  # make_tri ends in early 2025
 
 
-def test_btc_combine_in_and_out():
-    from tfsa_bot import btc
+def test_btc_cycle_clock_compares_same_day_count_in_earlier_cycles():
+    idx = pd.bdate_range("2016-01-01", "2025-06-30")
+    lvl = pd.Series(np.linspace(1.0, 10.0, len(idx)), index=idx)  # steady climb: today is always the high
+    c = btc.cycle_clock(pd.DataFrame({"btc": lvl, "cash": 1.0}))
+    assert c["last_halving"] == "2024-04-20"
+    assert c["days_since_halving"] == (idx[-1] - pd.Timestamp("2024-04-20")).days
+    assert c["from_cycle_high"] == 0 and c["above_that_low"] == 0
+    rows = {e["halving"]: e for e in c["same_point_in_earlier_cycles"]}
+    assert set(rows) == {"2016-07-09", "2020-05-11"}  # 2012: before our history
+    e = rows["2020-05-11"]
+    i = idx.searchsorted(pd.Timestamp("2020-05-11") + pd.Timedelta(days=c["days_since_halving"]))
+    assert e["date"] == idx[i].date().isoformat()
+    assert e["next"]["252d"] == pytest.approx(lvl.iloc[i + 252] / lvl.iloc[i] - 1, abs=1e-4)
+    assert e["from_cycle_high"] == 0
+    early = btc.cycle_clock(pd.DataFrame({"btc": lvl.loc[:"2016-06-01"], "cash": 1.0}))
+    assert early["last_halving"] == "2012-11-28" and early["same_point_in_earlier_cycles"] == []
+
+
+def test_bitcoin_notification_states_map_to_in_out(monkeypatch):
+    from tfsa_bot import engine
+    sent = []
+    monkeypatch.setattr(engine.notify, "send", lambda t, b: sent.append(t))
+    base = {"changes": [], "new_week": False, "news": None, "news_fresh": False}
+    b = {"signal": "OUT", "previous_week": "OUT", "new_week": False, "latest": {"state": "UP"}}
+    engine._maybe_notify({**base, "bitcoin": b}, None, {})
+    assert sent == ["Bitcoin heads-up"]
+    engine._maybe_notify({**base, "bitcoin": b}, None, {"bitcoin": {"latest": {"state": "UP"}}})  # already told
+    engine._maybe_notify({**base, "bitcoin": {**b, "latest": {"state": "DOWN"}}}, None, {})       # agrees
+    assert sent == ["Bitcoin heads-up"]
+    engine._maybe_notify({**base, "bitcoin": {**b, "signal": "IN", "new_week": True}}, None, {})
+    assert sent == ["Bitcoin heads-up", "Bitcoin trend: IN"]
+
+
+def test_research_indicator_rules_match_the_live_signal():
+    from tfsa_bot import research
+    for tri in (make_tri({"btc": 0.003}), make_tri({})):
+        assert research.indicator_rule("trend_score")(tri) == btc.is_in(tri)
+    tri = make_tri({})
+    tri.index = pd.bdate_range("2025-12-01", periods=len(tri))  # ends early 2027: ~33 months after the 2024 halving
+    assert research.halving_calendar_rule(tri)
+    assert not research.halving_calendar_rule(tri.loc[:"2026-06-30"])  # month 26: inside the OUT window
+
+
+def test_research_btc_mix_in_and_out():
+    from tfsa_bot import research
     core = pd.Series({"ca_eq": 0.25, "us_eq": 0.25, "btc": 0.15, "cash": 0.35})
-    w = btc.combine(core, True, 0.5)
+    w = research.mix(core, True, 0.5)
     assert w["btc"] == pytest.approx(0.5 + 0.075)
     assert w["ca_eq"] == pytest.approx(0.125)
     assert w.sum() == pytest.approx(1.0)
-    w = btc.combine(core, False, 0.5)
+    w = research.mix(core, False, 0.5)
     assert w["btc"] == pytest.approx(0.075)
     assert w["cash"] == pytest.approx(0.5 + 0.175)
     assert w.sum() == pytest.approx(1.0)
 
 
-def test_btc_combine_band_avoids_small_weekly_trades():
-    from tfsa_bot import btc
+def test_research_btc_mix_band_avoids_small_weekly_trades():
+    from tfsa_bot import research
     core = pd.Series({"ca_eq": 0.5, "cash": 0.5})
-    assert btc.combine(core, True, 0.5, current_btc=0.56)["btc"] == pytest.approx(0.56)  # drifted 6pts: keep
-    assert btc.combine(core, True, 0.5, current_btc=0.65)["btc"] == pytest.approx(0.5)   # 15pts: trim
-    assert btc.combine(core, True, 0.5, current_btc=0.0)["btc"] == pytest.approx(0.5)    # entering: full share
-    assert btc.combine(core, False, 0.5, current_btc=0.56)["btc"] == 0.0                 # OUT: sell it all
+    assert research.mix(core, True, 0.5, current_btc=0.56)["btc"] == pytest.approx(0.56)  # drifted 6pts: keep
+    assert research.mix(core, True, 0.5, current_btc=0.65)["btc"] == pytest.approx(0.5)   # 15pts: trim
+    assert research.mix(core, True, 0.5, current_btc=0.0)["btc"] == pytest.approx(0.5)    # entering: full share
+    assert research.mix(core, False, 0.5, current_btc=0.56)["btc"] == 0.0                 # OUT: sell it all
     for cur in (0.0, 0.4, 0.56, 0.9):
-        w = btc.combine(core, True, 0.5, current_btc=cur)
+        w = research.mix(core, True, 0.5, current_btc=cur)
         assert w.sum() == pytest.approx(1.0) and (w >= -1e-12).all()
 
 
-def test_btc_core_view_sets_pot_aside():
-    from tfsa_bot import btc
+def test_research_core_view_sets_pot_aside():
+    from tfsa_bot import research
     cur = pd.Series({"ca_eq": 0.3, "btc": 0.55, "cash": 0.15})
-    assert btc.core_view(cur, 0.5)["btc"] == pytest.approx(0.05)
-    assert btc.core_view(cur, 0.0)["btc"] == pytest.approx(0.55)
-    assert btc.core_view(None, 0.5) is None
+    assert research.core_view(cur, 0.5)["btc"] == pytest.approx(0.05)
+    assert research.core_view(cur, 0.0)["btc"] == pytest.approx(0.55)
+    assert research.core_view(None, 0.5) is None

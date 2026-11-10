@@ -30,6 +30,8 @@ class Result:
 
 
 def rebalance_dates(index: pd.DatetimeIndex, freq: str) -> pd.DatetimeIndex:
+    if freq == "daily":
+        return index
     s = pd.Series(index, index=index)
     rule = {"weekly": "W-FRI", "monthly": "ME", "quarterly": "QE"}[freq]
     return pd.DatetimeIndex(s.groupby(pd.Grouper(freq=rule)).last().dropna().values)

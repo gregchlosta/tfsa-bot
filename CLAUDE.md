@@ -2,7 +2,7 @@
 
 Personal trading assistant for one Wealthsimple TFSA (Core plan). Started Nov 2026 with ~$2k, will scale to ~$20k if forward results hold up. The owner places trades manually; the bot gives signals via CLI, the Claude app (MCP) and notifications.
 
-**Signals only.** The bot outputs target % per ETF and what changed since last week. It never asks for or stores balances, deposits or fills (the owner removed that in Nov 2026 and tracks holdings in their own Claude chats). Don't add account tracking or dollar sizing back.
+**Analysis and signals only.** The bot reports the trend signal of every ETF (and, on request, of any Yahoo ticker), the strategy's model portfolio and its weekly changes, the Bitcoin trend signal, stress and news. It holds no money, holdings or allocation settings (the owner removed account tracking, sizing and the Bitcoin share in Nov 2026). The LLM reading the MCP report decides allocation with the owner. Don't add any of that back.
 
 ## Goal
 Beat buy-and-hold (XEQT/VFV) after costs, with smaller drawdowns, using ONE simple strategy. If it can't, the honest answer is "hold the index", and the bot should say so.
@@ -14,11 +14,15 @@ Beat buy-and-hold (XEQT/VFV) after costs, with smaller drawdowns, using ONE simp
 - **Stress gauge is information only.** It was backtested as a gate (block new buys) and cost 0.5–1.5%/yr.
 - **News check is a shadow track.** Recommendations follow `core`; the `overlay` paper track records what the news check would have done. Switch `follow` to `overlay` in `data/config.json` only after ~3+ months, and only if it's ahead on both return and drawdown (`tfsa-bot performance`).
 - **Overlay can only reduce risk** (block new entries, halve positions). Never let it add risk; a test enforces this.
-- **Bitcoin pot** (`btc.py`, `btc_share` in config; owner chose 50% in Nov 2026): that share is all FBTC or all CASH.TO, flipped weekly on the core's own momentum score for Bitcoin. The core underneath is unchanged (keeps its 15% cap). Backtest from 2015-09 (`research` §7): 50% pot with the rule 47% CAGR / -47% max DD vs always-Bitcoin 48% / -58%; returns are inflated by 2015-21. Stop-losses (20/25/30%) were tested and gave noise (-5/-8/+7% CAGR), so none. Mid-week monitoring (live score, flip price) is information only.
+- **Bitcoin trend signal** (`btc.py`): IN (FBTC) / OUT (cash), weekly, using the core's own momentum score for Bitcoin; separate from the core (which keeps its 15% cap). How much to put in it is the owner's call (they're considering ~50%), not a bot setting. Backtest from 2015-09 (`research` §7): 50% slice following the signal 47% CAGR / -47% max DD vs always-Bitcoin 48% / -58%; returns are inflated by 2015-21. Stop-losses (20/25/30%) were tested and gave noise (-5/-8/+7% CAGR), so none.
+- **The Bitcoin rule was tested against alternatives and kept** (`research` §8, Bitcoin-or-cash from 2015-09): score 68% CAGR / -70% DD; fast 1/3m score 54% / -84%; price > 100-day avg 56% / -76%; price > 200-day avg 66% / -70%; 50/200-day cross 67% / -70%; score checked daily 71% / -73% (noise). The score entered 45-55% above the 2018 and 2022 lows and left 25-38% below the 2021 and 2025 highs; faster rules were ~25 points earlier at the turns but worse overall. A halving-calendar rule shows 118% / -60%, but it was drawn after seeing the three cycles, so it proves nothing. Don't swap the rule for a faster one or a calendar one without out-of-sample evidence.
+- **One confirmed signal per asset; the rest is information.** The indicator panel (`signals.indicators`), latest-close score, flip prices and the Bitcoin cycle clock (`btc.cycle_clock`) help read the weekly signal. They never change it and never trigger a model-portfolio change.
 - **Trading frequency stays low** (weekly, ~10–13 trades/yr): avoids CRA "business income" risk in a TFSA.
 
 ## Architecture
 - `strategy.target_weights()` is the single pure signal function used by the backtest AND live. Keep it that way.
+- `signals.py` is the pure per-asset layer (score, flip level, streak, indicator panel); it works on any total-return series, so `btc.py` and the ad-hoc ticker lookup reuse it. `signals.score` must equal `strategy.scores` (a test enforces this). `research` §8 runs the same indicator functions the live panel shows.
+- `engine.load_market()` gives the `Market` view every entry point shares; `engine.run_cycle()` is the only writer (paper tracks, runs). `report.py` renders text.
 - Backtest and paper replay share execution rules: decide at the close, execute at the next close, 10 bps per leg.
 - Signals use completed daily closes only (`engine.completed_returns` drops today's partial bar).
 - Canadian ETF history is spliced with US proxies converted to CAD (`data.py`); proxies carry an annual drag for MER and withholding tax.
@@ -27,11 +31,12 @@ Beat buy-and-hold (XEQT/VFV) after costs, with smaller drawdowns, using ONE simp
 - MCP: `mcp` 2.x (`MCPServer`, not FastMCP). Schedule: launchd plist written by `install.py`. The API key is read from `~/.zshrc` by `bin/run-cycle.sh`.
 
 ## Working on it
-- `uv run pytest` must pass; tests are offline. Add tests for any change to strategy, overlay, btc, signal changes or paper.
+- `uv run pytest` must pass; tests are offline. Add tests for any change to strategy, signals, overlay, btc or paper.
 - Re-run `uv run tfsa-bot research` after any strategy or data change and compare against the numbers above.
 - Don't write to the real `data/tfsa.db` in experiments; monkeypatch `db.DB_PATH` as the tests do.
 
 ## Possible next steps
 - Review the forward test after ~12 weeks: core vs overlay vs XEQT-like.
 - Optional: hosted (remote) MCP so it works from the phone; phone push via `ntfy_topic`.
-- Only if justified: USD account → enable US sleeves; IBKR API for auto-execution (Wealthsimple has no official API).
+- USD account (free on Wealthsimple Premium, which needs $100k; ~$10/month on Core): even with no FX fee the US sleeves gave 14.0% CAGR / -36% DD vs 13.7% / -29% without them, so it is not worth paying for.
+- Only if justified: IBKR API for auto-execution (Wealthsimple has no official API).
