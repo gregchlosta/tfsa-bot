@@ -8,9 +8,9 @@ Personal trading assistant for one Wealthsimple TFSA (Core plan). Started Nov 20
 Beat buy-and-hold (XEQT/VFV) after costs, with smaller drawdowns, using ONE simple strategy. If it can't, the honest answer is "hold the index", and the bot should say so.
 
 ## Decisions already made (with evidence; don't undo without new evidence)
-- **CAD-listed ETFs only.** Wealthsimple Core charges ~1.5% FX each way; with US-listed ETFs the backtest CAGR fell from 13.8% to ~8.5%. US sleeves exist in `universe.py` but are off (`Params.markets`). Revisit only if the owner gets a USD account.
+- **CAD-listed ETFs only.** Wealthsimple Core charges ~1.5% FX each way; with US-listed ETFs the backtest CAGR fell from 13.6% to 11.8% and the max drawdown deepened from -29% to -36% (`research` §1, Nov 2026; an earlier version showed ~8.5%). US sleeves exist in `universe.py` but are off (`Params.markets`). Revisit only if the owner gets a USD account.
 - **Strategy params** (top 4, equal weight, hold_buffer 2, blended 1/3/6/12m lookback, weekly): picked for robustness across the grid in `research.py`, not as the single best cell. Don't tune params to the backtest; selection bias is already a known caveat.
-- **Crypto is a big part of the backtest edge** (without it: 9.1% CAGR, same as XEQT, half the drawdown). Keep the caps (BTC 15%, ETH 10%).
+- **Crypto is a big part of the backtest edge** (without it: 9.0% CAGR / -23% DD vs XEQT-like 9.2% / -46%, i.e. same return, half the drawdown). Keep the caps (BTC 15%, ETH 10%).
 - **Stress gauge is information only.** It was backtested as a gate (block new buys) and cost 0.5–1.5%/yr.
 - **News check is a shadow track.** Recommendations follow `core`; the `overlay` paper track records what the news check would have done. Switch `follow` to `overlay` in `data/config.json` only after ~3+ months, and only if it's ahead on both return and drawdown (`tfsa-bot performance`).
 - **Overlay can only reduce risk** (block new entries, halve positions). Never let it add risk; a test enforces this.
@@ -48,5 +48,5 @@ Beat buy-and-hold (XEQT/VFV) after costs, with smaller drawdowns, using ONE simp
 - Review the forward test after ~12 weeks: core vs overlay vs XEQT-like.
 - Backtest a wider CAD-listed ETF universe as a portfolio (the watchlist ETFs with proxies for their early history) before adding any of them to `SLEEVES`.
 - Optional: hosted (remote) MCP so it works from the phone; phone push via `ntfy_topic`.
-- USD account (free on Wealthsimple Premium, which needs $100k; ~$10/month on Core): even with no FX fee the US sleeves gave 14.0% CAGR / -36% DD vs 13.7% / -29% without them, so it is not worth paying for.
+- USD account (free on Wealthsimple Premium, which needs $100k; ~$10/month on Core): even with no FX fee the US sleeves gave 14.0% CAGR / -36% DD vs 13.6% / -29% without them, so it is not worth paying for.
 - Only if justified: IBKR API for auto-execution (Wealthsimple has no official API).
