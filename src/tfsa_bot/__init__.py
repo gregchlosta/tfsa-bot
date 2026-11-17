@@ -14,6 +14,13 @@ def main() -> None:
     sub.add_parser("btc", help="Bitcoin trend signal: weekly IN/OUT, flip price, indicator panel, cycle clock")
     sg = sub.add_parser("signal", help="trend signal for one asset: a universe ETF or any Yahoo Finance ticker")
     sg.add_argument("ticker")
+    sc = sub.add_parser("scan", help="trend signal of everything scanned (model ETFs + watchlist) and this week's flips")
+    sc.add_argument("--kind", choices=["equity", "sector", "real_estate", "bond", "commodity", "crypto", "stock", "cdr", "custom"])
+    sc.add_argument("--show", choices=["all", "events", "up", "down"], default="all",
+                    help="events = only rows with a flip, a pending flip or close to one")
+    for name, what in (("watch", "add"), ("unwatch", "remove")):
+        wp = sub.add_parser(name, help=f"{what} scan tickers (Yahoo Finance symbols); the model portfolio is unaffected")
+        wp.add_argument("tickers", nargs="+")
     sub.add_parser("mcp", help="run the MCP server (stdio)")
     sub.add_parser("install-schedule", help="install macOS launchd job (weekdays 09:45, 12:30, 16:45)")
     sub.add_parser("uninstall-schedule", help="remove the launchd job")
@@ -41,6 +48,15 @@ def main() -> None:
     elif args.cmd == "signal":
         from . import engine, report
         print(report.signal_text(engine.asset_report(engine.load_market(), args.ticker)))
+    elif args.cmd == "scan":
+        from . import engine, report, scan
+        out = engine.scan_report(engine.load_market())
+        print(report.scan_text(out, scan.select(out["rows"], args.kind, args.show)))
+    elif args.cmd in ("watch", "unwatch"):
+        from . import db, scan
+        cfg = scan.edit_watchlist(db.config(), **{"add" if args.cmd == "watch" else "remove": args.tickers})
+        db.save_config(cfg)
+        print(json.dumps({k: cfg[k] for k in ("watchlist_extra", "watchlist_hidden")}, indent=2))
     elif args.cmd == "mcp":
         from .mcp_server import main as mcp_main
         mcp_main()

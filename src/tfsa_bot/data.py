@@ -16,6 +16,7 @@ from .universe import CASH, CORE_KEYS, FX_TICKER, SLEEVES, STRESS_TICKERS
 DATA_DIR = Path(__file__).resolve().parents[2] / "data"
 RAW_CACHE = DATA_DIR / "raw_prices.pkl"
 CASH_CACHE = DATA_DIR / "cad_tbill.pkl"
+WATCH_CACHE = DATA_DIR / "watch_prices.pkl"
 CACHE_MAX_AGE_H = 6
 
 
@@ -56,9 +57,52 @@ def load_raw(refresh: bool = False) -> pd.DataFrame:
     return df
 
 
+def load_watch(tickers: list[str], refresh: bool = False) -> pd.DataFrame:
+    """Adjusted closes for the watchlist, cached on disk. A ticker Yahoo doesn't know is an empty column."""
+    want = sorted(set(tickers))
+    if not want:
+        return pd.DataFrame()
+    if not refresh and _fresh(WATCH_CACHE):
+        df = pd.read_pickle(WATCH_CACHE)
+        if set(want) <= set(df.columns):
+            return df[want]
+    DATA_DIR.mkdir(exist_ok=True)
+    df = yf.download(want, start="2000-01-01", auto_adjust=True, progress=False)["Close"]
+    df.index = pd.to_datetime(df.index).tz_localize(None)
+    df = df.reindex(columns=want)
+    df.to_pickle(WATCH_CACHE)
+    return df
+
+
+def series_index(px: pd.Series, cal: pd.DatetimeIndex, drag: float = 0.0) -> pd.Series:
+    """One price series as a total-return index on the TSX calendar (same alignment as the universe),
+    less an annual `drag`. NaN before its history starts and once it is more than 5 days stale."""
+    a = px.reindex(px.index.union(cal)).ffill(limit=5).reindex(cal)
+    r = a.pct_change() - drag / 252
+    return (1 + r.fillna(0)).cumprod().where(a.notna())
+
+
+def stale(px: pd.DataFrame, cal: pd.DatetimeIndex, as_of: pd.Timestamp, max_lag: int = 2) -> dict[str, dict]:
+    """Tickers whose last price is `max_lag` or more trading days older than `as_of`, or missing entirely.
+
+    Prices are forward-filled for up to 5 days when building returns, so without this check a ticker
+    Yahoo stopped updating would just look flat. One day of lag is normal (US vs Canadian holidays)."""
+    out = {}
+    for t in px.columns:
+        s = px[t].dropna()
+        if s.empty:
+            out[t] = {"last": None, "trading_days_old": None}
+            continue
+        last = s.index[-1]
+        lag = int(((cal > last) & (cal <= as_of)).sum())
+        if lag >= max_lag:
+            out[t] = {"last": last.date().isoformat(), "trading_days_old": lag}
+    return out
+
+
 def load_ticker(ticker: str) -> pd.Series:
     """Adjusted daily closes for any Yahoo Finance ticker (not cached): for one-off signal lookups."""
-    df = yf.Ticker(ticker).history(period="5y", auto_adjust=True)
+    df = yf.Ticker(ticker).history(period="max", auto_adjust=True)
     if df.empty:
         raise ValueError(f"no price history for {ticker!r} on Yahoo Finance")
     s = df["Close"].dropna()

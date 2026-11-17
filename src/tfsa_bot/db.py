@@ -14,6 +14,8 @@ DEFAULT_CONFIG = {
     "follow": "core",  # "core" (backtested) or "overlay" (core + news check, once it has proven itself)
     "use_llm": True,
     "ntfy_topic": None,  # set to a private random string to get phone pushes via ntfy.sh
+    "watchlist_extra": [],  # Yahoo tickers scanned on top of universe.WATCHLIST
+    "watchlist_hidden": [],  # default watchlist tickers to leave out of the scan
 }
 
 SCHEMA = """
@@ -24,6 +26,8 @@ CREATE TABLE IF NOT EXISTS assessments (
   id INTEGER PRIMARY KEY, created_at TEXT, as_of TEXT, stress TEXT, llm TEXT, headlines TEXT, model TEXT);
 CREATE TABLE IF NOT EXISTS runs (
   id INTEGER PRIMARY KEY, created_at TEXT, summary TEXT);
+CREATE TABLE IF NOT EXISTS state (
+  key TEXT PRIMARY KEY, value TEXT);
 """
 
 
@@ -93,7 +97,15 @@ def save_run(summary: dict) -> None:
         con.execute("INSERT INTO runs (created_at, summary) VALUES (?,?)", (now(), json.dumps(summary, default=str)))
 
 
-def last_run() -> dict | None:
+
+# --- small key-value state (what has already been notified) ------------------
+
+def get_state(key: str):
     with connect() as con:
-        r = con.execute("SELECT * FROM runs ORDER BY id DESC LIMIT 1").fetchone()
-    return json.loads(r["summary"]) if r else None
+        r = con.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
+    return json.loads(r["value"]) if r else None
+
+
+def set_state(key: str, value) -> None:
+    with connect() as con:
+        con.execute("INSERT OR REPLACE INTO state VALUES (?,?)", (key, json.dumps(value)))

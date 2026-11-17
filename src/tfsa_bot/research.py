@@ -9,8 +9,9 @@ import pandas as pd
 
 from . import backtest as bt
 from . import btc, signals
-from .data import build_returns
-from .strategy import Params, target_weights
+from .data import build_returns, total_return_index
+from .strategy import Params, scores, target_weights, universe_keys
+from .universe import BY_KEY
 
 START = "2006-01-01"  # leaves 1y warm-up after data starts (late 2004)
 FMT = {
@@ -147,6 +148,39 @@ def btc_signal_study(rets: pd.DataFrame, start: str = "2015-09-01") -> None:
           "three cycles after the fact. Verdict: keep the score as the signal; show the rest as information.")
 
 
+def every_uptrend_fn(p: Params, mode: str):
+    """No fixed count: hold every sleeve with a positive score.
+    mode 'equal' = split evenly among them; 'slots' = 1/len(universe) each, the rest in cash."""
+    keys = universe_keys(p)
+
+    def fn(tri, current):
+        sc = scores(tri[keys + ["cash"]], p)
+        up = list(sc[sc > 0].index)
+        w = pd.Series(0.0, index=keys + ["cash"])
+        for k in up:
+            w[k] = min(1 / (len(up) if mode == "equal" else len(keys)), BY_KEY[k].max_weight)
+        w["cash"] = 1.0 - w.drop("cash").sum()
+        return w
+    return fn
+
+
+def signal_record_study(rets: pd.DataFrame, p: Params) -> None:
+    """Section 9: is one asset's UP/DOWN signal worth following on its own? (signals.track_record, the
+    same numbers the scan shows beside every signal.)"""
+    tri = total_return_index(rets)
+    rows = {}
+    for k in universe_keys(p):
+        r = signals.track_record(tri, k, p)
+        rows[BY_KEY[k].ticker] = {
+            "from": r["from"][:4], "signal CAGR": f"{r['signal_cagr']:.1%}", "hold CAGR": f"{r['hold_cagr']:.1%}",
+            "signal MaxDD": f"{r['signal_max_dd']:.0%}", "hold MaxDD": f"{r['hold_max_dd']:.0%}",
+            "flips/yr": r["flips_per_year"], "time in": f"{r['time_in']:.0%}",
+        }
+    print(pd.DataFrame(rows).T.to_string())
+    print("Following the signal on one asset alone roughly halves the drawdown but returns less than holding it,\n"
+          "except for Bitcoin. A per-asset BUY/SELL is a risk signal; the edge comes from holding the strongest few.\n")
+
+
 def main() -> None:
     rets = build_returns()
     base = Params()
@@ -218,6 +252,21 @@ def main() -> None:
 
     print("=== 8. Bitcoin signal alternatives (Bitcoin or cash, from 2015-09) ===")
     btc_signal_study(rets)
+
+    print("\n=== 9. Each ETF's own signal: the asset while UP, cash while DOWN, vs holding it ===")
+    signal_record_study(rets, base)
+
+    print("=== 10. No fixed count: top N vs holding every uptrend ===")
+    rows = {}
+    for a, b in ((START, None), (START, "2015-12-31"), ("2016-01-01", None)):
+        tag = f"{a[:4]}-{(b or 'now')[:4]}"
+        rows[f"{tag} top4 (DEFAULT)"] = bt.run(rets, bt.strategy_fn(base), start=a, end=b).stats
+        rows[f"{tag} top8"] = bt.run(rets, bt.strategy_fn(replace(base, top_n=8)), start=a, end=b).stats
+        rows[f"{tag} every uptrend, equal weight"] = bt.run(rets, every_uptrend_fn(base, "equal"), start=a, end=b).stats
+        rows[f"{tag} every uptrend, 1/13 each"] = bt.run(rets, every_uptrend_fn(base, "slots"), start=a, end=b).stats
+    print(table(rows))
+    print("Holding every uptrend more than doubles the trades for no extra return; top 8 is ahead since 2016 but behind in 2006-15.\n"
+          "Verdict: keep the fixed top 4 for the model portfolio; show every signal in the scan as information.")
 
 
 if __name__ == "__main__":

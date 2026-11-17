@@ -6,10 +6,12 @@
    (core = backtested strategy, overlay = core + news check, btc = Bitcoin signal). Mid-week,
    news can only cut overlay positions.
 4. Report: the strategy's model portfolio (follows config 'follow') and what changed since last
-   week, the trend signal of every ETF, the Bitcoin signal, stress gauge and news.
+   week, the trend signal of every ETF, this week's signal events across the whole scan (model
+   ETFs + watchlist), the Bitcoin signal, stress gauge and news.
    Analysis and signals only: the bot knows nothing about your money or how you split it.
    The LLM reading the report (Claude app via MCP) does that part with you.
-5. Notify when a signal changes.
+5. Notify when a signal changes. What has been announced is kept in db state, so a report opened
+   from the app or the CLI (which never notifies) can't swallow a notification.
 """
 
 from dataclasses import dataclass
@@ -18,11 +20,11 @@ from datetime import datetime, timedelta
 import pandas as pd
 
 from . import backtest as bt
-from . import btc, data, db, news, notify, overlay, paper, signals
+from . import btc, data, db, news, notify, overlay, paper, scan, signals
 from . import stress as stress_mod
 from .report import change_text
 from .strategy import Params, scores, target_weights, universe_keys
-from .universe import BY_KEY, SLEEVES, Sleeve
+from .universe import BY_KEY, CASH, SLEEVES, STRESS_TICKERS, Sleeve, Watch
 
 NEWS_MAX_AGE_H = 72
 
@@ -128,25 +130,48 @@ def run_cycle(refresh: bool = True, with_news: bool = True, use_llm: bool | None
     prev = pd.Series(decs[-2]["weights"], dtype=float) if len(decs) > 1 else None
     _, shadow_notes = overlay.apply(rec, core_pw, risk, flags)
 
+    try:  # the watchlist is information: a failed download must never break the core report
+        sc = scan.build(m, cfg, p, refresh, {k for k, v in rec.items() if k != "cash" and v > 1e-4})
+        scan_summary = {k: sc[k] for k in ("events", "counts", "stale")}
+    except Exception as e:
+        scan_summary = {"error": f"{type(e).__name__}: {e}"}
+
     summary = {
         "generated": db.now(), "data_as_of": m.as_of.date().isoformat(), "signal_week": week_s,
         "new_week": new_week, "follow": cfg["follow"],
         "stress": stress,
         "news": {k: view[k] for k in ("market_risk", "summary", "key_events", "flags", "confidence")} if view else None,
         "news_fresh": llm is not None, "news_error": err, "headline_count": len(heads),
+        "data_warnings": data_warnings(m, p),
         "model_portfolio": {BY_KEY[k].ticker: v for k, v in _w(rec).items()},
+        "model_rule": {"top_n": p.top_n, "hold_buffer": p.hold_buffer},
         "trends": market_trends(m, ranking, rec, p),
+        "scan": scan_summary,
         "target_notes": decs[-1]["notes"] if decs else [],
         "news_check_would_change": shadow_notes if cfg["follow"] == "core" else [],
         "changes": None if prev is None else signals.signal_changes(prev, rec),
         "changes_since": decs[-2]["as_of"] if len(decs) > 1 else None,
         "bitcoin": bitcoin_report(m, p, btc_new_week, float(rec.get("btc", 0.0))),
     }
-    prev_run = db.last_run() or {}
     db.save_run(summary)
     if send:
-        _maybe_notify(summary, prev_llm, prev_run)
+        _maybe_notify(summary, prev_llm)
     return summary
+
+
+def scan_report(m: Market, p: Params = Params(), refresh: bool = False) -> dict:
+    """The full scan (model ETFs + watchlist), marking what the model portfolio holds. Read-only."""
+    cfg = db.config()
+    decs = db.decisions(cfg["follow"])
+    held = {k for k, v in decs[-1]["weights"].items() if k != "cash" and v > 1e-4} if decs else set()
+    return scan.build(m, cfg, p, refresh, held)
+
+
+def data_warnings(m: Market, p: Params) -> list[dict]:
+    """Tickers behind today's signals whose prices have stopped updating (see data.stale)."""
+    tickers = [BY_KEY[k].ticker for k in universe_keys(p)] + [CASH.ticker, BY_KEY["btc"].proxy, *STRESS_TICKERS]
+    old = data.stale(m.raw.reindex(columns=tickers), m.rets.index, m.as_of)
+    return [{"ticker": t, **v} for t, v in old.items()]
 
 
 def _record_paper_tracks(m: Market, p: Params, core_pw: pd.Series | None, ov_pw: pd.Series | None,
@@ -187,6 +212,7 @@ def bitcoin_report(m: Market, p: Params, new_week: bool = False, in_model: float
         "previous_week": ("IN" if decs[-2]["weights"].get("btc") else "OUT") if len(decs) > 1 else None,
         "new_week": new_week,
         "in_model_portfolio": round(in_model, 4),
+        "record": signals.track_record(m.tri, "btc", p),
     })
     return out
 
@@ -205,7 +231,17 @@ def market_trends(m: Market, ranking: pd.Series, model: pd.Series, p: Params) ->
             "indicators_up": a["indicators_up"], "indicators_known": a["indicators_known"],
             "in_model": float(model.get(k, 0.0)) > 1e-4,
         })
+        rows[-1]["model_status"] = model_status(rank, w["state"], rows[-1]["in_model"], p)
     return rows
+
+
+def model_status(rank: int, trend: str | None, in_model: bool, p: Params) -> str | None:
+    """Why an ETF is or isn't in the model portfolio when the plain "top N" reading would say otherwise:
+    'held', 'held_by_buffer' (ranks below the top N but within the hold buffer, so it stays), or
+    'next_in_line' (ranks in the top N but waits, because a buffered holding keeps the slot)."""
+    if in_model:
+        return "held" if rank <= p.top_n else "held_by_buffer"
+    return "next_in_line" if trend == "UP" and rank <= p.top_n else None
 
 
 def find_sleeve(query: str) -> Sleeve | None:
@@ -218,24 +254,33 @@ def find_sleeve(query: str) -> Sleeve | None:
 
 
 def asset_report(m: Market, query: str, p: Params = Params()) -> dict:
-    """Trend signal for one asset: anything in the universe, or any Yahoo Finance ticker."""
+    """Trend signal for one asset: a model ETF, a watchlist entry, or any Yahoo Finance ticker."""
     s = find_sleeve(query)
     if s:
-        out = {"ticker": s.ticker, "name": s.name, **signals.asset_signal(m.tri_w, m.tri, s.key, p, m.close(s.ticker))}
+        out = {"ticker": s.ticker, "name": s.name, **signals.asset_signal(m.tri_w, m.tri, s.key, p, m.close(s.ticker)),
+               "record": signals.track_record(m.tri, s.key, p)}
         if s.market not in p.markets:
             out["note"] = ("US-listed, measured in CAD. Not in the model portfolio: the ~1.5% FX fee each way "
                            "erased the edge in the backtest.")
         return out
-    px = data.load_ticker(query.strip().upper())
-    cal = m.rets.index
-    a = px.reindex(px.index.union(cal)).ffill(limit=5).reindex(cal)  # same alignment as the universe
-    tri = pd.DataFrame({"asset": a / a.dropna().iloc[0], "cash": m.tri["cash"]})
-    return {
-        "ticker": query.strip().upper(), "name": "(outside the universe)",
-        **signals.asset_signal(tri.loc[:m.week], tri, "asset", p, _last(a)),
-        "note": ("Outside the backtested universe: same trend maths, in the ticker's own currency against CAD "
-                 "cash. Information only, the strategy was never tested on it."),
-    }
+    cfg = db.config()
+    w = scan.find_watch(query, cfg)
+    if w:
+        px = data.load_watch([x.history for x in scan.watchlist(cfg, p)])[w.history]
+        note = "On the watchlist, outside the backtested strategy: same trend maths, information only."
+        if w.source:
+            note = (f"CAD-hedged CDR: the signal is computed on {w.source} in USD (what the CDR tracks) less "
+                    f"{w.drag:.1%}/yr for the hedge; prices shown are {w.source}'s in US$. Outside the backtested "
+                    "strategy: information only, and single stocks are noisier than ETFs.")
+    else:
+        w = Watch(query.strip().upper(), "(outside the watchlist)", "custom")
+        px = data.load_ticker(w.ticker)
+        note = ("Outside the backtested universe: same trend maths, in the ticker's own currency against CAD "
+                "cash. Information only, the strategy was never tested on it.")
+    got = scan.watch_signal(m, w, px, p)
+    if got is None:
+        raise ValueError(f"no price history for {w.history!r} on Yahoo Finance")
+    return {"ticker": w.ticker, "name": w.name, "price_ticker": w.history, **got[0], "record": got[1], "note": note}
 
 
 def _last(a: pd.Series) -> float | None:
@@ -243,12 +288,20 @@ def _last(a: pd.Series) -> float | None:
     return float(a.iloc[-1]) if len(a) else None
 
 
-def _maybe_notify(s: dict, prev_llm: dict | None, prev_run: dict | None = None) -> None:
+def _maybe_notify(s: dict, prev_llm: dict | None) -> None:
+    """Only scheduled runs get here. What was already announced lives in db state, not in the run log:
+    reports opened from the app or the CLI also log runs, and must not count as "already told"."""
     msgs = []
     now = datetime.now(data.TZ)
+    week = s["signal_week"]
+    first = db.get_state("notified_week") != week  # this week's signal hasn't been announced yet
     monday_morning = now.weekday() == 0 and now.hour < 11
-    if s["changes"] and (s["new_week"] or monday_morning):
+    if s["changes"] and (first or monday_morning):
         msgs.append(("New weekly signal", "; ".join(change_text(c) for c in s["changes"][:5])))
+    ev = (s.get("scan") or {}).get("events")
+    if first and ev and (ev["buy"] or ev["sell"]):
+        parts = [f"{side.upper()}: {_tickers(ev[side])}" for side in ("buy", "sell") if ev[side]]
+        msgs.append(("Trend flips this week", "; ".join(parts)))
     n = s["news"]
     if s["news_fresh"] and n:
         was = (prev_llm or {}).get("market_risk", "normal")
@@ -260,12 +313,19 @@ def _maybe_notify(s: dict, prev_llm: dict | None, prev_run: dict | None = None) 
             msgs.append((f"News flag: {BY_KEY[f['sleeve']].ticker} {f['action']}", f["reason"][:200]))
     b = s["bitcoin"]
     live = {"UP": "IN", "DOWN": "OUT"}.get(b["latest"]["state"])
-    prev_live = (((prev_run or {}).get("bitcoin") or {}).get("latest") or {}).get("state")
-    if b["new_week"]:
-        if b["previous_week"] and b["previous_week"] != b["signal"]:
-            msgs.append((f"Bitcoin trend: {b['signal']}", f"Weekly Bitcoin signal flipped {b['previous_week']} -> {b['signal']}."))
-    elif live and live != b["signal"] and b["latest"]["state"] != prev_live:
+    if first and b["previous_week"] and b["previous_week"] != b["signal"]:
+        msgs.append((f"Bitcoin trend: {b['signal']}", f"Weekly Bitcoin signal flipped {b['previous_week']} -> {b['signal']}."))
+    if not live or live == b["signal"]:
+        db.set_state("btc_heads_up", None)
+    elif live != db.get_state("btc_heads_up"):
         msgs.append(("Bitcoin heads-up", f"If the week closed now, the Bitcoin signal would be {live}. "
                      "Only Friday's close confirms it."))
+        db.set_state("btc_heads_up", live)
+    db.set_state("notified_week", week)
     for title, body in msgs:
         notify.send(title, body)
+
+
+def _tickers(items: list[dict], limit: int = 6) -> str:
+    more = f" +{len(items) - limit} more" if len(items) > limit else ""
+    return ", ".join(i["ticker"] for i in items[:limit]) + more

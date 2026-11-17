@@ -217,19 +217,43 @@ def test_btc_cycle_clock_compares_same_day_count_in_earlier_cycles():
     assert early["last_halving"] == "2012-11-28" and early["same_point_in_earlier_cycles"] == []
 
 
+def _note_summary(**bitcoin) -> dict:
+    b = {"signal": "OUT", "previous_week": "OUT", "new_week": False, "latest": {"state": "DOWN"}, **bitcoin}
+    return {"signal_week": "2026-11-13", "changes": [], "new_week": False, "news": None, "news_fresh": False,
+            "scan": None, "bitcoin": b}
+
+
 def test_bitcoin_notification_states_map_to_in_out(monkeypatch):
     from tfsa_bot import engine
     sent = []
     monkeypatch.setattr(engine.notify, "send", lambda t, b: sent.append(t))
-    base = {"changes": [], "new_week": False, "news": None, "news_fresh": False}
-    b = {"signal": "OUT", "previous_week": "OUT", "new_week": False, "latest": {"state": "UP"}}
-    engine._maybe_notify({**base, "bitcoin": b}, None, {})
+    up = _note_summary(latest={"state": "UP"})
+    engine._maybe_notify(up, None)
     assert sent == ["Bitcoin heads-up"]
-    engine._maybe_notify({**base, "bitcoin": b}, None, {"bitcoin": {"latest": {"state": "UP"}}})  # already told
-    engine._maybe_notify({**base, "bitcoin": {**b, "latest": {"state": "DOWN"}}}, None, {})       # agrees
+    engine._maybe_notify(up, None)             # already told
+    engine._maybe_notify(_note_summary(), None)  # agrees again: forget the heads-up
     assert sent == ["Bitcoin heads-up"]
-    engine._maybe_notify({**base, "bitcoin": {**b, "signal": "IN", "new_week": True}}, None, {})
-    assert sent == ["Bitcoin heads-up", "Bitcoin trend: IN"]
+    engine._maybe_notify(up, None)             # disagrees again later: tell again
+    assert sent == ["Bitcoin heads-up"] * 2
+    engine._maybe_notify({**_note_summary(signal="IN", latest={"state": "UP"}), "signal_week": "2026-11-20"}, None)
+    assert sent == ["Bitcoin heads-up"] * 2 + ["Bitcoin trend: IN"]
+
+
+def test_report_opened_without_notifying_does_not_swallow_notifications(monkeypatch):
+    """The app and the CLI log runs too (send=False). They used to count as "already told"."""
+    from tfsa_bot import engine
+    sent = []
+    monkeypatch.setattr(engine.notify, "send", lambda t, b: sent.append((t, b)))
+    ev = {"buy": [{"ticker": "XIT.TO"}], "sell": [{"ticker": f"S{i}.TO"} for i in range(8)]}
+    s = {**_note_summary(latest={"state": "UP"}), "scan": {"events": ev},
+         "changes": [{"action": "BUY", "ticker": "XIT.TO", "name": "Canadian tech", "from": 0.0, "to": 0.25}]}
+    db.save_run({**s, "new_week": True})  # what get_brief does right after Friday's close
+    engine._maybe_notify(s, None)
+    assert [t for t, _ in sent] == ["New weekly signal", "Trend flips this week", "Bitcoin heads-up"]
+    assert sent[1][1] == "BUY: XIT.TO; SELL: S0.TO, S1.TO, S2.TO, S3.TO, S4.TO, S5.TO +2 more"
+    monkeypatch.setattr(engine, "datetime", type("D", (), {"now": staticmethod(lambda tz=None: pd.Timestamp("2026-11-18 12:30"))}))
+    engine._maybe_notify(s, None)  # same week, a Wednesday: nothing new
+    assert len(sent) == 3
 
 
 def test_research_indicator_rules_match_the_live_signal():
@@ -273,3 +297,139 @@ def test_research_core_view_sets_pot_aside():
     assert research.core_view(cur, 0.5)["btc"] == pytest.approx(0.05)
     assert research.core_view(cur, 0.0)["btc"] == pytest.approx(0.55)
     assert research.core_view(None, 0.5) is None
+
+
+# ---- per-asset track record, events, scan ---------------------------------------------------------
+
+def wavy(days: int = 1500, seed: int = 1) -> pd.DataFrame:
+    """Daily returns for a Bitcoin-like asset that trends up and down in turns, plus cash."""
+    idx = pd.bdate_range("2015-01-01", periods=days)
+    rng = np.random.default_rng(seed)
+    drift = 0.002 * np.sin(np.arange(days) / 60)
+    return pd.DataFrame({"btc": drift + rng.normal(0, 0.01, days), "cash": 0.0001}, index=idx)
+
+
+def test_track_record_matches_the_backtest_engine():
+    from tfsa_bot import backtest as bt
+    from tfsa_bot import research
+    rets = wavy()
+    tri = (1 + rets).cumprod()
+    rec = signals.track_record(tri, "btc")
+    ref = bt.run(rets, research.btc_rule_fn(research.indicator_rule("trend_score")), start=rec["from"]).stats
+    assert rec["flips_per_year"] > 1  # the series really switches
+    assert rec["signal_cagr"] == pytest.approx(ref["CAGR"], abs=1e-4)
+    assert rec["signal_max_dd"] == pytest.approx(ref["MaxDD"], abs=1e-4)
+    assert rec["flips_per_year"] == pytest.approx(ref["Trades/yr"], abs=0.05)
+    assert rec["time_in"] == pytest.approx(1 - ref["Cash%"], abs=0.01)
+    hold = (1 + rets["btc"].loc[rec["from"]:]).cumprod()
+    assert rec["hold_max_dd"] == pytest.approx(float((hold / hold.cummax() - 1).min()), abs=1e-4)
+    assert signals.track_record(tri.iloc[:400], "btc") is None  # under a year of signals
+
+
+def test_flags_buy_sell_pending_near():
+    up = {"state": "UP", "flipped": True}
+    assert signals.flags(up, {"state": "UP", "flip_move": -0.2}, 0.03) == {"event": "BUY", "pending": None, "near_flip": False}
+    assert signals.flags({"state": "DOWN", "flipped": True}, {"state": "DOWN", "flip_move": 0.01}, 0.03) == \
+        {"event": "SELL", "pending": None, "near_flip": True}
+    held = {"state": "UP", "flipped": False}
+    assert signals.flags(held, {"state": "DOWN", "flip_move": 0.01}, 0.03) == {"event": None, "pending": "DOWN", "near_flip": False}
+    assert signals.flags({"state": None}, {"state": None, "flip_move": None}, None) == {"event": None, "pending": None, "near_flip": False}
+
+
+def test_asset_signal_marks_a_flip_only_when_the_week_before_disagreed():
+    idx = pd.bdate_range("2023-01-02", periods=400)
+    lvl = pd.Series(np.linspace(100, 80, 400), index=idx)
+    lvl.iloc[-2:] = 140.0  # jumps in the final week: last week-end UP, the one before DOWN
+    tri = pd.DataFrame({"btc": lvl, "cash": 1.0})
+    a = signals.asset_signal(tri, tri, "btc")
+    assert a["weekly"]["state"] == "UP" and a["weekly"]["weeks"] == 1 and a["weekly"]["flipped"]
+    assert a["event"] == "BUY"
+    first = signals.asset_signal(tri.iloc[:254], tri.iloc[:254], "btc")  # its first signal ever is not a flip
+    assert first["weekly"]["weeks"] == 1 and not first["weekly"]["flipped"] and first["event"] is None
+
+
+def test_model_status_explains_the_hold_buffer():
+    from tfsa_bot.engine import model_status
+    p = Params()
+    assert model_status(2, "UP", True, p) == "held"
+    assert model_status(6, "UP", True, p) == "held_by_buffer"
+    assert model_status(4, "UP", False, p) == "next_in_line"
+    assert model_status(5, "UP", False, p) is None and model_status(3, "DOWN", False, p) is None
+
+
+def test_stale_prices_are_flagged_and_lose_their_signal():
+    from tfsa_bot import data
+    cal = pd.bdate_range("2026-01-01", periods=30)
+    px = pd.DataFrame({"OK": 1.0, "DAY": 1.0, "OLD": 1.0, "GONE": np.nan}, index=cal)
+    px.loc[cal[-1]:, "DAY"] = np.nan  # one day behind: normal (US vs Canadian holidays)
+    px.loc[cal[-7]:, "OLD"] = np.nan
+    assert data.stale(px, cal, cal[-1]) == {
+        "OLD": {"last": cal[-8].date().isoformat(), "trading_days_old": 7},
+        "GONE": {"last": None, "trading_days_old": None},
+    }
+    lvl = data.series_index(px["OLD"].dropna(), cal)
+    assert lvl.iloc[-7:-2].notna().all() and lvl.iloc[-2:].isna().all()  # filled for 5 days, then no price
+    drag = data.series_index(pd.Series(1.0, index=cal), cal, drag=0.0252)
+    assert drag.iloc[-1] == pytest.approx((1 - 0.0001) ** 29)
+
+
+def test_watchlist_is_separate_from_the_strategy_universe():
+    from tfsa_bot.universe import SLEEVES, WATCHLIST
+    tickers = [w.ticker for w in WATCHLIST]
+    assert len(tickers) == len(set(tickers))
+    assert not set(tickers) & {s.ticker for s in SLEEVES}
+    assert all(w.source and w.drag > 0 for w in WATCHLIST if w.kind == "cdr")
+    assert all(w.kind in __import__("tfsa_bot.scan", fromlist=["KINDS"]).KINDS for w in WATCHLIST)
+
+
+def test_edit_watchlist():
+    from tfsa_bot import scan
+    cfg = scan.edit_watchlist({"follow": "core"}, add=["bce.to", "CHPS.TO"], remove=["XGD.TO"])
+    assert cfg == {"follow": "core", "watchlist_extra": ["BCE.TO"], "watchlist_hidden": ["XGD.TO"]}
+    names = [w.ticker for w in scan.watchlist(cfg)]
+    assert "BCE.TO" in names and "XGD.TO" not in names and "CHPS.TO" in names
+    cfg = scan.edit_watchlist(cfg, add=["XGD.TO"], remove=["BCE.TO"])
+    assert cfg["watchlist_extra"] == [] and cfg["watchlist_hidden"] == []
+    assert scan.find_watch("nvda", cfg).ticker == "NVDA.NE" and scan.find_watch("BRK-B", cfg).ticker == "BRK.NE"
+    assert scan.find_watch("shop", cfg).ticker == "SHOP.TO" and scan.find_watch("ZZZZ", cfg) is None
+
+
+def test_scan_covers_both_tiers_and_never_touches_the_model(monkeypatch):
+    from tfsa_bot import data, engine, report, scan
+    from tfsa_bot.universe import BY_KEY
+    tri = make_tri({"ca_banks": 0.003, "ca_energy": 0.0025, "gold": 0.002, "us_eq": 0.0015, "bonds": -0.001}, days=600)
+    raw = tri.drop(columns="cash").rename(columns=lambda k: BY_KEY[k].ticker)
+    m = engine.Market(raw, tri.pct_change().fillna(0.0), tri, tri.index[-1])
+    idx = tri.index
+    watch = pd.DataFrame({
+        "CHPS.TO": np.linspace(10, 30, 600),                      # steady uptrend
+        "ZID.TO": np.linspace(30, 10, 600),                       # steady downtrend
+        "NVDA": np.linspace(100, 400, 600),                       # the CDR's history
+        "SOLQ.TO": [np.nan] * 500 + list(np.linspace(5, 9, 100)),  # under 12 months
+    }, index=idx)
+    watch.loc[idx[-4]:, "ZID.TO"] = np.nan  # Yahoo stopped updating it
+    monkeypatch.setattr(data, "load_watch", lambda tickers, refresh=False: watch.reindex(columns=sorted(set(tickers))))
+    before = target_weights(m.tri_w)
+
+    sc = scan.build(m, {}, held={"ca_banks"})
+    rows = {r["ticker"]: r for r in sc["rows"]}
+    assert len(rows) == len(universe_keys(Params())) + len(scan.watchlist({}))
+    assert rows["ZEB.TO"]["tier"] == "model" and rows["ZEB.TO"]["in_model"] and rows["ZEB.TO"]["record"]
+    assert rows["CHPS.TO"]["tier"] == "watch" and rows["CHPS.TO"]["trend"] == "UP" and not rows["CHPS.TO"]["in_model"]
+    assert rows["NVDA.NE"]["trend"] == "UP" and rows["NVDA.NE"]["priced_as"] == "NVDA"
+    assert rows["SOLQ.TO"]["trend"] is None and rows["SOLQ.TO"]["stale"] is None  # too young, not stale
+    assert rows["ZID.TO"]["stale"]["trading_days_old"] == 4 and "ZID.TO" in sc["stale"]
+    assert rows["XGD.TO"]["trend"] is None and rows["XGD.TO"]["stale"] == {"last": None, "trading_days_old": None}
+    assert all(i["ticker"] != "ZID.TO" for group in sc["events"].values() for i in group)
+    scores_ = [r["score"] for r in sc["rows"] if r["score"] is not None]
+    assert scores_ == sorted(scores_, reverse=True)
+    assert sc["counts"]["up"] + sc["counts"]["down"] + sc["counts"]["no_signal"] == len(rows)
+    assert {r["ticker"] for r in scan.select(sc["rows"], kind="cdr")} == {w.ticker for w in scan.watchlist({}) if w.kind == "cdr"}
+    assert all(r["trend"] == "UP" for r in scan.select(sc["rows"], show="up"))
+    pd.testing.assert_series_equal(before, target_weights(m.tri_w))  # the scan is information only
+
+    text = report.scan_text(sc)
+    assert "CHPS.TO" in text and "STALE" in text and "needs 12 months of history" in text
+    a = engine.asset_report(m, "nvda")
+    assert a["ticker"] == "NVDA.NE" and a["price_ticker"] == "NVDA" and "CDR" in a["note"]
+    assert a["record"] and "Track record of following this signal" in report.signal_text(a)

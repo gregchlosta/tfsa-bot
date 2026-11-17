@@ -68,3 +68,119 @@ STRESS_TICKERS = ["^VIX", "HYG", "IEF", "SPY"]
 CORE_KEYS = ["ca_eq", "us_eq", "intl", "em", "bonds", "gold", "cash"]
 
 BY_KEY = {s.key: s for s in SLEEVES + [CASH]}
+
+
+# ---- watchlist: scanned for signals, never part of the model portfolio ----------------------------
+#
+# Everything here is CAD-listed (no FX fee on Wealthsimple). The scan gives each one the same weekly
+# trend signal as the ETFs above, as information: the strategy was only backtested on SLEEVES, and
+# `strategy.target_weights` never sees the watchlist. Single stocks are far noisier than ETFs.
+#
+# CDRs (Canadian Depositary Receipts, Cboe Canada) are CAD-hedged slices of US stocks. Yahoo has no
+# usable history for them, so the signal is computed on the US stock in USD (which is what a hedged
+# CDR tracks) less `CDR_DRAG` a year for the hedge.
+
+CDR_DRAG = 0.006
+
+
+@dataclass(frozen=True)
+class Watch:
+    ticker: str  # what you buy on Wealthsimple
+    name: str
+    kind: str  # equity | sector | bond | commodity | crypto | stock | cdr | custom
+    source: str | None = None  # Yahoo ticker that carries the price history, when it isn't `ticker`
+    drag: float = 0.0  # annual drag applied to the source's returns
+
+    @property
+    def history(self) -> str:
+        return self.source or self.ticker
+
+
+def _cdr(us: str, name: str, ticker: str | None = None) -> Watch:
+    return Watch(ticker or f"{us}.NE", f"{name} (CDR, CAD-hedged)", "cdr", source=us, drag=CDR_DRAG)
+
+
+WATCHLIST: list[Watch] = [
+    # --- broad equity and regions ---
+    Watch("XEQT.TO", "All-equity portfolio (the buy-and-hold benchmark)", "equity"),
+    Watch("XQQ.TO", "Nasdaq-100 (CAD-hedged)", "equity"),
+    Watch("XSU.TO", "US small caps (CAD-hedged)", "equity"),
+    Watch("XMD.TO", "Canadian mid caps", "equity"),
+    Watch("XCS.TO", "Canadian small caps", "equity"),
+    Watch("ZLB.TO", "Canadian low-volatility stocks", "equity"),
+    Watch("VDY.TO", "Canadian high-dividend stocks", "equity"),
+    Watch("XEU.TO", "Europe", "equity"),
+    Watch("ZJPN.TO", "Japan", "equity"),
+    Watch("ZID.TO", "India", "equity"),
+    Watch("ZCH.TO", "China", "equity"),
+    # --- sectors and themes ---
+    Watch("XFN.TO", "Canadian financials", "sector"),
+    Watch("XMA.TO", "Canadian materials", "sector"),
+    Watch("XGD.TO", "Gold miners", "sector"),
+    Watch("ZUT.TO", "Canadian utilities", "sector"),
+    Watch("XST.TO", "Canadian consumer staples", "sector"),
+    Watch("ZIN.TO", "Canadian industrials", "sector"),
+    Watch("XHC.TO", "Global health care", "sector"),
+    Watch("ZUH.TO", "US health care (CAD-hedged)", "sector"),
+    Watch("ZUB.TO", "US banks (CAD-hedged)", "sector"),
+    Watch("TEC.TO", "Global technology leaders", "sector"),
+    Watch("CHPS.TO", "Semiconductors", "sector"),
+    Watch("CYBR.TO", "Cybersecurity", "sector"),
+    Watch("HURA.TO", "Uranium", "sector"),
+    Watch("COPP.TO", "Copper miners", "sector"),
+    Watch("ZCLN.TO", "Clean energy", "sector"),
+    Watch("ZGI.TO", "Global infrastructure", "sector"),
+    # --- bonds ---
+    Watch("XSB.TO", "Canadian short-term bonds", "bond"),
+    Watch("ZFL.TO", "Canadian long federal bonds", "bond"),
+    Watch("XRB.TO", "Canadian real-return bonds", "bond"),
+    Watch("ZTL.NE", "US long Treasuries (20y+)", "bond"),
+    Watch("ZHY.TO", "US high-yield bonds (CAD-hedged)", "bond"),
+    Watch("ZPR.TO", "Canadian preferred shares", "bond"),
+    # --- commodities and crypto ---
+    Watch("SVR.TO", "Silver (CAD-hedged)", "commodity"),
+    Watch("HUC.TO", "Crude oil (futures)", "commodity"),
+    Watch("SOLQ.TO", "Solana", "crypto"),
+    # --- large Canadian stocks ---
+    Watch("RY.TO", "Royal Bank", "stock"),
+    Watch("TD.TO", "TD Bank", "stock"),
+    Watch("BMO.TO", "Bank of Montreal", "stock"),
+    Watch("MFC.TO", "Manulife", "stock"),
+    Watch("BN.TO", "Brookfield", "stock"),
+    Watch("SHOP.TO", "Shopify", "stock"),
+    Watch("CSU.TO", "Constellation Software", "stock"),
+    Watch("TRI.TO", "Thomson Reuters", "stock"),
+    Watch("CNQ.TO", "Canadian Natural Resources", "stock"),
+    Watch("SU.TO", "Suncor", "stock"),
+    Watch("ENB.TO", "Enbridge", "stock"),
+    Watch("CNR.TO", "CN Rail", "stock"),
+    Watch("CP.TO", "CPKC Rail", "stock"),
+    Watch("WCN.TO", "Waste Connections", "stock"),
+    Watch("ATD.TO", "Couche-Tard", "stock"),
+    Watch("DOL.TO", "Dollarama", "stock"),
+    Watch("L.TO", "Loblaw", "stock"),
+    Watch("AEM.TO", "Agnico Eagle", "stock"),
+    Watch("CCO.TO", "Cameco", "stock"),
+    Watch("NTR.TO", "Nutrien", "stock"),
+    # --- US stocks as CDRs ---
+    _cdr("NVDA", "Nvidia"),
+    _cdr("AAPL", "Apple"),
+    _cdr("MSFT", "Microsoft"),
+    _cdr("AMZN", "Amazon"),
+    _cdr("GOOG", "Alphabet"),
+    _cdr("META", "Meta"),
+    _cdr("TSLA", "Tesla"),
+    _cdr("AVGO", "Broadcom"),
+    _cdr("AMD", "AMD"),
+    _cdr("NFLX", "Netflix"),
+    _cdr("PLTR", "Palantir"),
+    _cdr("UBER", "Uber"),
+    _cdr("COST", "Costco"),
+    _cdr("WMT", "Walmart"),
+    _cdr("DIS", "Disney"),
+    _cdr("LLY", "Eli Lilly"),
+    _cdr("JPM", "JPMorgan"),
+    _cdr("BRK-B", "Berkshire Hathaway", "BRK.NE"),
+    _cdr("V", "Visa", "VISA.NE"),
+    _cdr("MA", "Mastercard"),
+]

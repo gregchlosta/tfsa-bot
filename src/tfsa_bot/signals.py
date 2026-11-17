@@ -2,7 +2,8 @@
 
 The confirmed signal for any asset is the strategy's own score at the last completed week:
 UP when its average 1/3/6/12-month return beats cash. Everything else here is context for
-reading that signal: how far the price is from flipping it, how long it has held, and a small
+reading that signal: how far the price is from flipping it, how long it has held, whether it
+just changed (`flags`), what following it has done on this asset (`track_record`), and a small
 panel of independent trend indicators. `research` section 8 backtests every indicator of the
 panel on Bitcoin; none beat the score, the faster ones turn earlier but whipsaw more.
 """
@@ -96,15 +97,56 @@ def snapshot(tri: pd.DataFrame, key: str, p: Params = Params()) -> dict:
     }
 
 
+def weekly_states(tri_w: pd.DataFrame, key: str, p: Params = Params()) -> pd.Series:
+    """The confirmed signal at every week-end with enough history: True = UP."""
+    h = score_history(tri_w, key, p.lookbacks)
+    return h.reindex(bt.rebalance_dates(tri_w.index, "weekly")).dropna() > 0
+
+
+def _run_length(up: pd.Series) -> int:
+    return int((up == up.iloc[-1])[::-1].astype(int).cumprod().sum())
+
+
 def streak(tri_w: pd.DataFrame, key: str, p: Params = Params()) -> tuple[str | None, int]:
     """(week-end date the current weekly state began, number of weekly signals it has held)."""
-    h = score_history(tri_w, key, p.lookbacks)
-    wk = h.reindex(bt.rebalance_dates(tri_w.index, "weekly")).dropna()
-    if wk.empty:
+    up = weekly_states(tri_w, key, p)
+    if up.empty:
         return None, 0
-    up = wk > 0
-    n = int((up == up.iloc[-1])[::-1].astype(int).cumprod().sum())
-    return wk.index[-n].date().isoformat(), n
+    n = _run_length(up)
+    return up.index[-n].date().isoformat(), n
+
+
+def track_record(tri: pd.DataFrame, key: str, p: Params = Params(), cost_bps: float = 10.0) -> dict | None:
+    """What following this asset's weekly signal on its own (the asset while UP, cash while DOWN) did,
+    next to holding it throughout. Same rules as the backtest: decide at the week's last close, trade at
+    the next close, `cost_bps` per leg. None with under a year of signals.
+
+    It answers "has this signal been worth following on this asset?"; it is not a forecast."""
+    t = tri[[key, "cash"]].loc[tri[key].first_valid_index():]
+    up = weekly_states(t, key, p)
+    if len(up) < 52:
+        return None
+    r = t.pct_change().fillna(0.0).loc[up.index[0]:]
+    after = up.astype(float).reindex(r.index).ffill().shift(1).fillna(0.0)  # position once that day's trade is done
+    pos = after.shift(1).fillna(0.0)  # position that earns the day's return
+    cost = (after - pos).abs() * 2 * cost_bps / 1e4  # a switch trades two legs: the asset and cash
+    eq = ((1 + pos * r[key] + (1 - pos) * r["cash"]) * (1 - cost)).cumprod()
+    hold = (1 + r[key]).cumprod()
+    years = (r.index[-1] - r.index[0]).days / 365.25
+
+    def cagr(e: pd.Series) -> float:
+        return round(float(e.iloc[-1] ** (1 / years) - 1), 4)
+
+    def max_dd(e: pd.Series) -> float:
+        return round(float((e / e.cummax() - 1).min()), 4)
+
+    return {
+        "from": r.index[0].date().isoformat(), "years": round(years, 1),
+        "signal_cagr": cagr(eq), "hold_cagr": cagr(hold),
+        "signal_max_dd": max_dd(eq), "hold_max_dd": max_dd(hold),
+        "flips_per_year": round(float((after != pos).sum()) / years, 1),
+        "time_in": round(float(pos.mean()), 2),
+    }
 
 
 def asset_signal(tri_w: pd.DataFrame, tri: pd.DataFrame, key: str, p: Params = Params(),
@@ -118,16 +160,22 @@ def asset_signal(tri_w: pd.DataFrame, tri: pd.DataFrame, key: str, p: Params = P
     a = tri[key].dropna()
     lvl = float(a.iloc[-1])
     weekly = snapshot(tri_w, key, p)
-    weekly["since"], weekly["weeks"] = streak(tri_w, key, p)
+    up = weekly_states(tri_w, key, p)
+    n = _run_length(up) if len(up) else 0
+    weekly["since"], weekly["weeks"] = (up.index[-n].date().isoformat(), n) if n else (None, 0)
+    weekly["flipped"] = n == 1 and len(up) > 1  # the signal changed at the last week-end
     latest = snapshot(tri, key, p)
     if close and latest["flip_move"] is not None:
         latest["close"] = round(float(close), 2)
         latest["flip_price"] = round(float(close) * (1 + latest["flip_move"]), 2)
     ind = indicators(tri, key, p)
     known = [i for i in ind if i["state"]]
+    move = float(a.pct_change().iloc[-63:].std() * np.sqrt(5)) if len(a) > 20 else None
     return {
         "weekly": weekly,
         "latest": latest,
+        **flags(weekly, latest, move),
+        "weekly_move": None if move is None or np.isnan(move) else round(move, 4),
         "cash_returns": _windows(tri["cash"], p),
         "vs_200d_avg": round(lvl / float(a.iloc[-200:].mean()) - 1, 4) if len(a) >= 200 else None,
         "from_3y_high": round(lvl / float(a.iloc[-756:].max()) - 1, 4),
@@ -135,6 +183,21 @@ def asset_signal(tri_w: pd.DataFrame, tri: pd.DataFrame, key: str, p: Params = P
         "indicators_up": sum(i["state"] == "UP" for i in known),
         "indicators_known": len(known),
     }
+
+
+def flags(weekly: dict, latest: dict, weekly_move: float | None) -> dict:
+    """What is new about a signal:
+      event     BUY / SELL when the confirmed weekly signal turned UP / DOWN at the last week-end
+      pending   the state at the latest close, when it disagrees with the weekly signal (only the
+                week's last close confirms it)
+      near_flip the latest close agrees, but the flip is within one typical week's move
+    """
+    w, n = weekly["state"], latest["state"]
+    event = {"UP": "BUY", "DOWN": "SELL"}[w] if w and weekly.get("flipped") else None
+    pending = n if w and n and n != w else None
+    flip = latest.get("flip_move")
+    near = bool(w and n == w and flip is not None and weekly_move and abs(flip) < weekly_move)
+    return {"event": event, "pending": pending, "near_flip": near}
 
 
 def _windows(s: pd.Series, p: Params) -> dict:
