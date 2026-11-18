@@ -8,7 +8,7 @@ from dataclasses import replace
 import pandas as pd
 
 from . import backtest as bt
-from . import btc, signals
+from . import btc, onchain, signals
 from .data import build_returns, total_return_index
 from .strategy import Params, scores, target_weights, universe_keys
 from .universe import BY_KEY
@@ -148,6 +148,75 @@ def btc_signal_study(rets: pd.DataFrame, start: str = "2015-09-01") -> None:
           "three cycles after the fact. Verdict: keep the score as the signal; show the rest as information.")
 
 
+def btc_frac_fn(rule):
+    """Bitcoin vs cash with a fraction: `rule(tri) -> share of Bitcoin` (0..1)."""
+    def fn(tri, current):
+        f = float(rule(tri))
+        return pd.Series({"btc": f, "cash": 1.0 - f})
+    return fn
+
+
+def onchain_rules(feat: pd.DataFrame) -> dict:
+    """Section 11 rules. `feat` = onchain.on_calendar(...) on the price calendar. Thresholds fixed in
+    advance (90th / 10th percentile of history known at the time; the standard 30/60-day hash ribbon)."""
+    sig = indicator_rule("trend_score")
+
+    def at(tri, col):
+        v = feat[col].get(tri.index[-1])
+        return None if v is None or pd.isna(v) else float(v)
+
+    def cut_when(cond):
+        return lambda tri: (0.5 if cond(tri) else 1.0) if sig(tri) else 0.0
+
+    hot = lambda tri: (at(tri, "mvrv_pct") or 0) >= onchain.HIGH          # noqa: E731
+    return {
+        "always Bitcoin": lambda tri: 1.0,
+        "SIGNAL: trend score": lambda tri: float(sig(tri)),
+        "signal, halve when MVRV >= 90th pct": cut_when(hot),
+        "signal, halve when Puell >= 90th pct": cut_when(lambda tri: (at(tri, "puell_pct") or 0) >= onchain.HIGH),
+        "signal, halve on miner stress (hash ribbon)": cut_when(lambda tri: (at(tri, "hash_ribbon") or 0) < 0),
+        "signal, OUT when MVRV >= 90th pct": lambda tri: float(sig(tri) and not hot(tri)),
+        "SHADOW: signal OR MVRV <= 10th pct (early entry)":
+            lambda tri: float(onchain.early_entry(sig(tri), at(tri, "mvrv_pct"))),
+        "MVRV only: IN unless >= 90th pct": lambda tri: float(not hot(tri)),
+    }
+
+
+def onchain_study(rets: pd.DataFrame, start: str = "2015-09-01") -> None:
+    """Section 11: do on-chain readings improve the Bitcoin signal? Bitcoin or cash, weekly."""
+    try:
+        feat = onchain.on_calendar(onchain.features(onchain.load()), rets.index)
+    except Exception as e:
+        print(f"(skipped: on-chain data unavailable: {type(e).__name__}: {e})")
+        return
+    r = rets[["btc", "cash"]]
+    rows = {}
+    for name, rule in onchain_rules(feat).items():
+        full = bt.run(r, btc_frac_fn(rule), start=start).stats
+        rows[name] = {k: full[k] for k in ("CAGR", "Sharpe", "MaxDD", "Trades/yr", "Cash%")}
+        for label, a, b in (("15-20", start, "2020-12-31"), ("21-now", "2021-01-01", None)):
+            st = bt.run(r, btc_frac_fn(rule), start=a, end=b).stats
+            rows[name][f"CAGR {label}"] = f"{st['CAGR']:.0%}"
+            rows[name][f"MaxDD {label}"] = f"{st['MaxDD']:.0%}"
+    print(table(rows), "\n")
+    f = feat.loc[start:]
+    print("Share of weeks each reading was on: "
+          f"MVRV >= 90th pct {(f['mvrv_pct'] >= onchain.HIGH).mean():.0%}, "
+          f"MVRV <= 10th pct {(f['mvrv_pct'] <= onchain.LOW).mean():.0%}, "
+          f"Puell >= 90th pct {(f['puell_pct'] >= onchain.HIGH).mean():.0%}, "
+          f"miner stress {(f['hash_ribbon'] < 0).mean():.0%}")
+    hot = f["mvrv_pct"] >= onchain.HIGH
+    yrs = sorted({d.year for d in hot[hot].index})
+    print(f"Years with MVRV >= 90th pct (as known then): {yrs or 'none'}")
+    cheap = f["mvrv_pct"] <= onchain.LOW
+    print(f"Years with MVRV <= 10th pct (as known then): {sorted({d.year for d in cheap[cheap].index}) or 'none'}")
+    print("Cutting on high valuations or miner stress is within noise (MVRV >= 90th pct was only reached in 2017 and\n"
+          "2021, and peaks get lower each cycle). Entering early when MVRV is in the bottom 10% was ahead in both\n"
+          "halves and at every threshold tried (5th-25th pct, MVRV <= 1), but it rests on two bottoms: late 2018 and\n"
+          "late 2022. Verdict: keep the trend score as the signal; paper-trade the early entry (track btc_onchain)\n"
+          "and show the readings as information.")
+
+
 def every_uptrend_fn(p: Params, mode: str):
     """No fixed count: hold every sleeve with a positive score.
     mode 'equal' = split evenly among them; 'slots' = 1/len(universe) each, the rest in cash."""
@@ -267,6 +336,9 @@ def main() -> None:
     print(table(rows))
     print("Holding every uptrend more than doubles the trades for no extra return; top 8 is ahead since 2016 but behind in 2006-15.\n"
           "Verdict: keep the fixed top 4 for the model portfolio; show every signal in the scan as information.")
+
+    print("\n=== 11. On-chain readings vs the Bitcoin signal (Bitcoin or cash, weekly, from 2015-09) ===")
+    onchain_study(rets)
 
 
 if __name__ == "__main__":

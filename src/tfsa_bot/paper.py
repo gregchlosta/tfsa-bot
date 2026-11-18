@@ -5,6 +5,9 @@ Tracks:
   overlay  - core + news/sentiment check (the part that can't be backtested)
   bench    - XEQT-like buy-and-hold from the same start date
   btc      - the Bitcoin trend signal (FBTC or cash, weekly), vs holding Bitcoin throughout
+  btc_onchain - shadow: the Bitcoin signal, or IN early while MVRV is in the bottom 10% of its
+             history (`onchain.early_entry`). Ahead in the backtest on two bottoms only; it would
+             replace the Bitcoin rule only after a new cycle bottom shows it ahead on return AND drawdown.
 The question this answers after a few months: does the news check earn its keep?
 """
 
@@ -68,6 +71,15 @@ def report(rets: pd.DataFrame) -> dict:
                           "max_drawdown": round(float((eq / eq.cummax() - 1).min()), 4),
                           "holding": "FBTC" if w.get("btc", 0) > 0.5 else "cash",
                           "bitcoin_held_throughout": round(float(hold.iloc[-1] / hold.iloc[0] - 1), 4)}
+    eq, w = replay(rets, db.decisions("btc_onchain"))
+    if len(eq):
+        out["btc_onchain_shadow"] = {
+            "since": eq.index[0].date().isoformat(), "return": round(eq.iloc[-1] - 1, 4),
+            "max_drawdown": round(float((eq / eq.cummax() - 1).min()), 4),
+            "holding": "FBTC" if w.get("btc", 0) > 0.5 else "cash",
+            "weeks_different": sum(bool(d["notes"]) for d in db.decisions("btc_onchain")),
+            "note": "Bitcoin signal + on-chain early entry. Only differs near cycle bottoms, so it may take years to judge.",
+        }
     out["weeks_of_data"] = len(db.decisions("core"))
     out["verdict"] = (
         "Too early to judge (need ~12+ weeks)." if out["weeks_of_data"] < 12

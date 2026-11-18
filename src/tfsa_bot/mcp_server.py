@@ -31,7 +31,7 @@ server = MCPServer(
         "them: deciding allocation and turning signals into trades is your job, together with the user, in "
         "this chat. Start with get_brief; use scan for the whole table, get_signal for one asset and "
         "bitcoin_status for Bitcoin. Signals change only on Friday's close. Everything else (latest-close "
-        "score, flip prices, the indicator panel, the Bitcoin cycle clock) is information for reading the "
+        "score, flip prices, the indicator panel, the Bitcoin cycle clock, the on-chain readings) is information for reading the "
         "signal, not a second signal: only the trend score was backtested, and the faster indicators have "
         "more false starts. Two things to say plainly when they matter. First, only the 13 model ETFs were "
         "backtested as a portfolio; the watchlist is information, and single stocks are noisier than ETFs. "
@@ -94,8 +94,11 @@ def bitcoin_status() -> dict:
     """Bitcoin signal in detail: weekly IN/OUT and how long it has held, the latest-close score, how far
     Bitcoin has to move to flip it (FBTC and BTC-USD prices), 1/3/6/12-month returns vs cash, the indicator
     panel (which faster or slower indicators already agree), and the halving-cycle clock with what followed
-    the same point in earlier cycles. The signal only changes on Friday's close; the panel and the cycle
-    clock are context, not predictions."""
+    the same point in earlier cycles, and on-chain readings (realized price, MVRV and its percentile in the
+    history known at the time, NUPL, Puell multiple, hash-rate trend, active addresses, what followed a
+    similar MVRV before). The signal only changes on Friday's close; the panel, the cycle clock and the
+    on-chain readings are context, not predictions. The on-chain early-entry rule is a shadow paper track
+    (see performance), backtested ahead on only two cycle bottoms: never present it as the signal."""
     s = engine.run_cycle(refresh=False, with_news=False, send=False)
     return {"text": report.btc_text(s["bitcoin"]), "data": s["bitcoin"]}
 

@@ -3,7 +3,8 @@
 1. Load the market (only completed daily closes are used for signals).
 2. Stress gauge (data) + headlines -> Claude news assessment (if enabled).
 3. Once per week (after Friday's close): record the weekly decision for the paper tracks
-   (core = backtested strategy, overlay = core + news check, btc = Bitcoin signal). Mid-week,
+   (core = backtested strategy, overlay = core + news check, btc = Bitcoin signal, btc_onchain =
+   the Bitcoin signal with the on-chain early entry, a shadow track). Mid-week,
    news can only cut overlay positions.
 4. Report: the strategy's model portfolio (follows config 'follow') and what changed since last
    week, the trend signal of every ETF, this week's signal events across the whole scan (model
@@ -20,7 +21,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 
 from . import backtest as bt
-from . import btc, data, db, news, notify, overlay, paper, scan, signals
+from . import btc, data, db, news, notify, onchain, overlay, paper, scan, signals
 from . import stress as stress_mod
 from .report import change_text
 from .strategy import Params, scores, target_weights, universe_keys
@@ -122,7 +123,8 @@ def run_cycle(refresh: bool = True, with_news: bool = True, use_llm: bool | None
     risk = view["market_risk"] if view else "normal"
     flags = {f["sleeve"]: f["action"] for f in view["flags"]} if view else {}
 
-    new_week, btc_new_week = _record_paper_tracks(m, p, core_pw, ov_pw, risk, flags)
+    chain = onchain_features(refresh)
+    new_week, btc_new_week = _record_paper_tracks(m, p, core_pw, ov_pw, risk, flags, chain)
 
     # --- the model portfolio: latest decision of the followed track ----------
     decs = db.decisions(cfg["follow"])
@@ -151,7 +153,7 @@ def run_cycle(refresh: bool = True, with_news: bool = True, use_llm: bool | None
         "news_check_would_change": shadow_notes if cfg["follow"] == "core" else [],
         "changes": None if prev is None else signals.signal_changes(prev, rec),
         "changes_since": decs[-2]["as_of"] if len(decs) > 1 else None,
-        "bitcoin": bitcoin_report(m, p, btc_new_week, float(rec.get("btc", 0.0))),
+        "bitcoin": bitcoin_report(m, p, btc_new_week, float(rec.get("btc", 0.0)), chain),
     }
     db.save_run(summary)
     if send:
@@ -174,8 +176,17 @@ def data_warnings(m: Market, p: Params) -> list[dict]:
     return [{"ticker": t, **v} for t, v in old.items()]
 
 
+def onchain_features(refresh: bool = False) -> pd.DataFrame | str:
+    """On-chain features, or the error text: on-chain data is information and must never break a run."""
+    try:
+        return onchain.features(onchain.load(refresh))
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+
+
 def _record_paper_tracks(m: Market, p: Params, core_pw: pd.Series | None, ov_pw: pd.Series | None,
-                         risk: str, flags: dict[str, str]) -> tuple[bool, bool]:
+                         risk: str, flags: dict[str, str],
+                         chain: pd.DataFrame | str | None = None) -> tuple[bool, bool]:
     """Forward test. Returns (core/overlay decision recorded now, Bitcoin decision recorded now)."""
     week_s = m.week.date().isoformat()
     new_week = not any(d["as_of"] == week_s for d in db.decisions("core"))
@@ -198,11 +209,18 @@ def _record_paper_tracks(m: Market, p: Params, core_pw: pd.Series | None, ov_pw:
     btc_new_week = not any(d["as_of"] == week_s for d in db.decisions("btc"))
     if btc_new_week:
         db.save_decision("btc", week_s, {"btc": 1.0} if btc.is_in(m.tri_w, p) else {"cash": 1.0})
+    # shadow: the same signal with the on-chain early entry; skipped (not guessed) without fresh data
+    row = onchain.known_at(chain, m.week) if isinstance(chain, pd.DataFrame) else None
+    if row is not None and not any(d["as_of"] == week_s for d in db.decisions("btc_onchain")):
+        on = onchain.early_entry(btc.is_in(m.tri_w, p), row["mvrv_pct"])
+        db.save_decision("btc_onchain", week_s, {"btc": 1.0} if on else {"cash": 1.0},
+                         [] if on == btc.is_in(m.tri_w, p) else ["early entry: MVRV in the bottom 10% of its history"])
     return new_week, btc_new_week
 
 
-def bitcoin_report(m: Market, p: Params, new_week: bool = False, in_model: float = 0.0) -> dict:
-    """The recorded weekly Bitcoin signal plus everything btc.status knows."""
+def bitcoin_report(m: Market, p: Params, new_week: bool = False, in_model: float = 0.0,
+                   chain: pd.DataFrame | str | None = None) -> dict:
+    """The recorded weekly Bitcoin signal plus everything btc.status knows, and the on-chain panel."""
     s = BY_KEY["btc"]
     out = btc.status(m.tri_w, m.tri, p, m.close(s.ticker), m.close(s.proxy))
     decs = db.decisions("btc")
@@ -214,6 +232,13 @@ def bitcoin_report(m: Market, p: Params, new_week: bool = False, in_model: float
         "in_model_portfolio": round(in_model, 4),
         "record": signals.track_record(m.tri, "btc", p),
     })
+    chain = onchain_features() if chain is None else chain
+    oc = onchain.panel(chain, m.as_of) if isinstance(chain, pd.DataFrame) else {"error": chain}
+    if "error" not in oc:
+        wk = onchain.known_at(chain, m.week)
+        oc["shadow_early_entry"] = None if wk is None else (
+            "IN" if onchain.early_entry(out["signal"] == "IN", wk["mvrv_pct"]) else "OUT")
+    out["onchain"] = oc
     return out
 
 

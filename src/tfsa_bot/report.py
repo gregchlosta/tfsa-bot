@@ -197,7 +197,42 @@ def btc_text(b: dict) -> str:
             nxt = ", ".join(f"{k} {pct(v, 0)}" for k, v in e["next"].items())
             frm = "" if e["from_cycle_high"] is None else f" was {pct(e['from_cycle_high'], 0)} from its cycle high;"
             L.append(f"    Same day-count after the {e['halving'][:4]} halving ({e['date']}):{frm} next {nxt} (trading days, CAD)")
+    L += onchain_lines(b.get("onchain"))
     return "\n".join(L)
+
+
+def _pctl(p: float | None) -> str:
+    if p is None:
+        return "n/a"
+    n = round(p * 100)
+    suffix = "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix} percentile"
+
+
+def onchain_lines(o: dict | None) -> list[str]:
+    if not o:
+        return []
+    if o.get("error"):
+        return [f"  ON-CHAIN: unavailable ({o['error']})"]
+    zone = {"high": " — HIGH: top 10% of its history", "low": " — LOW: bottom 10% of its history"}
+    L = [f"  ON-CHAIN (information only; data for {o['data_date']} UTC, {o['source']}):",
+         f"    Realized price (average cost of all coins) US${o['realized_price_usd']:,.0f}; price US${o['price_usd']:,.0f} "
+         f"is {pct(o['price_vs_realized'], 0)} vs it.",
+         f"    MVRV {o['mvrv']:.2f} ({_pctl(o['mvrv_pct'])}{zone.get(o['mvrv_zone'], '')}), MVRV Z {o['mvrv_z']}, "
+         f"NUPL {o['nupl']:+.2f}.",
+         f"    Puell multiple {o['puell']:.2f} ({_pctl(o['puell_pct'])}{zone.get(o['puell_zone'], '')}); "
+         f"hash rate 30d vs 60d {pct(o['hash_ribbon'])}{' (MINER STRESS)' if o['miner_stress'] else ''}; "
+         f"active addresses 30d vs 1y {pct(o['active_addr_trend'], 0)}."]
+    h = o.get("after_similar_mvrv") or {}
+    parts = [f"{k[5:-1]} days later median {pct(v['median'], 0)}, up {v['share_up']:.0%} of the time "
+             f"(range {pct(v['worst'], 0)} to {pct(v['best'], 0)})" for k, v in h.items() if k.startswith("next_")]
+    if parts:
+        L.append(f"    Earlier days at a similar MVRV percentile ({h['days']} days since {h['first'][:4]}, overlapping, few cycles): "
+                 + "; ".join(parts) + " (US$).")
+    s = o.get("shadow_early_entry")
+    if s:
+        L.append(f"    Shadow early-entry rule (IN also while MVRV is in the bottom 10%; paper-traded, not the signal): {s}.")
+    return L
 
 
 def _mark(r: dict) -> str:

@@ -433,3 +433,94 @@ def test_scan_covers_both_tiers_and_never_touches_the_model(monkeypatch):
     a = engine.asset_report(m, "nvda")
     assert a["ticker"] == "NVDA.NE" and a["price_ticker"] == "NVDA" and "CDR" in a["note"]
     assert a["record"] and "Track record of following this signal" in report.signal_text(a)
+
+
+# ---- on-chain -------------------------------------------------------------------------------------
+
+def chain_raw(days: int = 1500, seed: int = 2) -> pd.DataFrame:
+    """Synthetic CoinMetrics-like daily history (UTC dates)."""
+    from tfsa_bot import onchain
+    idx = pd.date_range("2016-01-01", periods=days, freq="D")
+    rng = np.random.default_rng(seed)
+    price = 1000 * np.exp(np.cumsum(0.002 * np.sin(np.arange(days) / 90) + rng.normal(0, 0.02, days)))
+    mvrv = 1.5 + np.sin(np.arange(days) / 120)
+    return pd.DataFrame({
+        "PriceUSD": price, "CapMrktCurUSD": price * 1.9e7, "CapMVRVCur": mvrv,
+        "IssTotUSD": price * 900 * (1 + 0.1 * rng.normal(size=days)), "HashRate": np.linspace(1, 5, days),
+        "AdrActCnt": 8e5 + rng.normal(0, 1e4, days),
+    }, index=idx)[list(onchain.METRICS)]
+
+
+def test_onchain_features_are_point_in_time():
+    from tfsa_bot import onchain
+    raw = chain_raw()
+    full, cut = onchain.features(raw), onchain.features(raw.iloc[:1000])
+    cols = ["mvrv_pct", "puell_pct", "mvrv_z", "puell", "hash_ribbon", "active_addr_trend"]
+    pd.testing.assert_frame_equal(full[cols].iloc[:1000], cut[cols])  # future data never changes the past
+    f = full.dropna(subset=["mvrv_pct"])
+    assert f["mvrv_pct"].between(0, 1).all()
+    assert full["realized_price_usd"].iloc[-1] == pytest.approx(raw["PriceUSD"].iloc[-1] / raw["CapMVRVCur"].iloc[-1])
+
+
+def test_onchain_value_is_used_the_day_after_its_utc_date():
+    from tfsa_bot import onchain
+    feat = onchain.features(chain_raw())
+    d = pd.Timestamp("2019-06-12")  # a Wednesday
+    cal = onchain.on_calendar(feat, pd.DatetimeIndex([d]))
+    assert cal.loc[d, "mvrv"] == feat.loc[d - pd.Timedelta(days=1), "mvrv"]
+    assert onchain.known_at(feat, d)["mvrv"] == cal.loc[d, "mvrv"]  # live and backtest see the same row
+    assert onchain.known_at(feat, feat.index[-1] + pd.Timedelta(days=10)) is None  # stale: no reading
+
+
+def test_onchain_panel_and_zones():
+    from tfsa_bot import onchain
+    feat = onchain.features(chain_raw())
+    o = onchain.panel(feat, feat.index[-1] + pd.Timedelta(days=1))
+    assert o["data_date"] == feat.index[-1].date().isoformat()
+    assert o["nupl"] == pytest.approx(1 - 1 / o["mvrv"], abs=1e-3)
+    assert o["mvrv_zone"] == onchain.zone(o["mvrv_pct"])
+    assert onchain.zone(0.95) == "high" and onchain.zone(0.05) == "low" and onchain.zone(0.5) == "middle"
+    assert "error" in onchain.panel(feat, feat.index[-1] + pd.Timedelta(days=30))
+
+
+def test_onchain_early_entry_only_adds_near_lows_and_research_uses_the_same_rule():
+    from tfsa_bot import onchain, research
+    assert onchain.early_entry(True, 0.99) and onchain.early_entry(True, None)  # never leaves earlier than the signal
+    assert onchain.early_entry(False, 0.05) and not onchain.early_entry(False, 0.5)
+    assert not onchain.early_entry(False, None) and not onchain.early_entry(False, float("nan"))
+    tri = make_tri({})  # flat: the trend signal is OUT
+    feat = pd.DataFrame({"mvrv_pct": 0.05, "puell_pct": 0.5, "hash_ribbon": 0.01}, index=tri.index)
+    rules = research.onchain_rules(feat)
+    assert rules["SHADOW: signal OR MVRV <= 10th pct (early entry)"](tri) == 1.0
+    assert rules["SIGNAL: trend score"](tri) == 0.0
+    up = make_tri({"btc": 0.003})
+    hot = pd.DataFrame({"mvrv_pct": 0.95, "puell_pct": 0.95, "hash_ribbon": -0.01}, index=up.index)
+    for name, rule in research.onchain_rules(hot).items():
+        if name.startswith("signal, "):  # the cut variants only ever reduce the signal's position
+            assert 0.0 <= rule(up) < research.onchain_rules(hot)["SIGNAL: trend score"](up) == 1.0
+
+
+def test_bitcoin_report_survives_missing_onchain_data(monkeypatch):
+    from tfsa_bot import engine
+    rets = wavy()
+    tri = (1 + rets).cumprod()
+    m = engine.Market(pd.DataFrame(index=rets.index), rets, tri, tri.index[-6])
+    out = engine.bitcoin_report(m, Params(), chain="URLError: offline")
+    assert out["onchain"] == {"error": "URLError: offline"}
+    assert out["signal"] in ("IN", "OUT")
+
+
+def test_shadow_onchain_track_records_early_entry_and_skips_without_data():
+    from tfsa_bot import engine, onchain
+    tri = make_tri({})  # flat Bitcoin: the trend signal is OUT
+    rets = tri.pct_change().fillna(0)
+    m = engine.Market(pd.DataFrame(index=tri.index), rets, tri, tri.index[-1])
+    engine._record_paper_tracks(m, Params(), None, None, "normal", {}, "offline")
+    assert db.decisions("btc")[-1]["weights"] == {"cash": 1.0}
+    assert db.decisions("btc_onchain") == []  # no data: nothing guessed
+    days = pd.date_range(tri.index[0] - pd.Timedelta(days=5), tri.index[-1], freq="D")
+    feat = pd.DataFrame({"mvrv": 0.8, "mvrv_pct": 0.04}, index=days)
+    engine._record_paper_tracks(m, Params(), None, None, "normal", {}, feat)
+    d = db.decisions("btc_onchain")[-1]
+    assert d["weights"] == {"btc": 1.0} and d["notes"]
+    assert onchain.known_at(feat, m.week)["mvrv_pct"] == 0.04

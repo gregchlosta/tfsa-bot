@@ -11,7 +11,7 @@ def main() -> None:
     rn.add_argument("--quiet", action="store_true", help="no notifications")
     sub.add_parser("brief", help="show the signal using cached data and the latest news check")
     sub.add_parser("performance", help="forward-test results")
-    sub.add_parser("btc", help="Bitcoin trend signal: weekly IN/OUT, flip price, indicator panel, cycle clock")
+    sub.add_parser("btc", help="Bitcoin trend signal: weekly IN/OUT, flip price, indicator panel, cycle clock, on-chain readings")
     sg = sub.add_parser("signal", help="trend signal for one asset: a universe ETF or any Yahoo Finance ticker")
     sg.add_argument("ticker")
     sc = sub.add_parser("scan", help="trend signal of everything scanned (model ETFs + watchlist) and this week's flips")
@@ -44,7 +44,7 @@ def main() -> None:
     elif args.cmd == "btc":
         from . import engine, report
         m = engine.load_market(refresh=True)
-        print(report.btc_text(engine.bitcoin_report(m, engine.Params())))
+        print(report.btc_text(engine.bitcoin_report(m, engine.Params(), chain=engine.onchain_features(refresh=True))))
     elif args.cmd == "signal":
         from . import engine, report
         print(report.signal_text(engine.asset_report(engine.load_market(), args.ticker)))
