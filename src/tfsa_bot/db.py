@@ -1,5 +1,6 @@
 """SQLite store: decisions per track, news assessments, run log. No account data: the bot only gives signals."""
 
+from contextlib import contextmanager
 import json
 import sqlite3
 from datetime import datetime
@@ -37,10 +38,21 @@ def now() -> str:
 
 def connect() -> sqlite3.Connection:
     DATA_DIR.mkdir(exist_ok=True)
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(DB_PATH, timeout=10.0)
     con.row_factory = sqlite3.Row
+    con.execute("PRAGMA journal_mode=WAL;")
     con.executescript(SCHEMA)
     return con
+
+
+@contextmanager
+def _conn():
+    con = connect()
+    try:
+        with con:
+            yield con
+    finally:
+        con.close()
 
 
 def config() -> dict:
@@ -60,7 +72,7 @@ def save_config(cfg: dict) -> None:
 # --- decisions -------------------------------------------------------------
 
 def save_decision(track: str, as_of: str, weights: dict, notes: list[str] | None = None) -> None:
-    with connect() as con:
+    with _conn() as con:
         con.execute(
             "INSERT OR REPLACE INTO decisions VALUES (?,?,?,?,?)",
             (track, as_of, now(), json.dumps(weights), json.dumps(notes or [])),
@@ -68,7 +80,7 @@ def save_decision(track: str, as_of: str, weights: dict, notes: list[str] | None
 
 
 def decisions(track: str) -> list[dict]:
-    with connect() as con:
+    with _conn() as con:
         rows = con.execute("SELECT * FROM decisions WHERE track=? ORDER BY as_of", (track,)).fetchall()
     return [{**dict(r), "weights": json.loads(r["weights"]), "notes": json.loads(r["notes"])} for r in rows]
 
@@ -76,7 +88,7 @@ def decisions(track: str) -> list[dict]:
 # --- assessments -----------------------------------------------------------
 
 def save_assessment(as_of: str, stress: dict, llm: dict | None, headlines: list, model: str | None) -> None:
-    with connect() as con:
+    with _conn() as con:
         con.execute(
             "INSERT INTO assessments (created_at, as_of, stress, llm, headlines, model) VALUES (?,?,?,?,?,?)",
             (now(), as_of, json.dumps(stress), json.dumps(llm), json.dumps(headlines), model),
@@ -85,7 +97,7 @@ def save_assessment(as_of: str, stress: dict, llm: dict | None, headlines: list,
 
 def latest_assessment(with_llm: bool = True) -> dict | None:
     q = "SELECT * FROM assessments " + ("WHERE llm != 'null' " if with_llm else "") + "ORDER BY id DESC LIMIT 1"
-    with connect() as con:
+    with _conn() as con:
         r = con.execute(q).fetchone()
     if not r:
         return None
@@ -93,7 +105,7 @@ def latest_assessment(with_llm: bool = True) -> dict | None:
 
 
 def save_run(summary: dict) -> None:
-    with connect() as con:
+    with _conn() as con:
         con.execute("INSERT INTO runs (created_at, summary) VALUES (?,?)", (now(), json.dumps(summary, default=str)))
 
 
@@ -101,11 +113,11 @@ def save_run(summary: dict) -> None:
 # --- small key-value state (what has already been notified) ------------------
 
 def get_state(key: str):
-    with connect() as con:
+    with _conn() as con:
         r = con.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
     return json.loads(r["value"]) if r else None
 
 
 def set_state(key: str, value) -> None:
-    with connect() as con:
+    with _conn() as con:
         con.execute("INSERT OR REPLACE INTO state VALUES (?,?)", (key, json.dumps(value)))

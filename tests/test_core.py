@@ -524,3 +524,99 @@ def test_shadow_onchain_track_records_early_entry_and_skips_without_data():
     d = db.decisions("btc_onchain")[-1]
     assert d["weights"] == {"btc": 1.0} and d["notes"]
     assert onchain.known_at(feat, m.week)["mvrv_pct"] == 0.04
+
+
+# ---- resilience, blended ranking, quality metrics & opportunities ---------------------------------
+
+def test_load_raw_and_watch_preserve_cache_on_failed_or_partial_download(tmp_path, monkeypatch):
+    from tfsa_bot import data
+    idx = pd.bdate_range("2024-01-01", periods=30)
+    good = pd.DataFrame({"XIC.TO": np.linspace(30, 35, 30), "VFV.TO": np.linspace(100, 120, 30)}, index=idx)
+    raw_p = tmp_path / "raw.pkl"
+    watch_p = tmp_path / "watch.pkl"
+    monkeypatch.setattr(data, "RAW_CACHE", raw_p)
+    monkeypatch.setattr(data, "WATCH_CACHE", watch_p)
+    monkeypatch.setattr(data, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(data, "_all_tickers", lambda: ["VFV.TO", "XIC.TO"])
+    data._write_pickle(good, raw_p)
+    data._write_pickle(good, watch_p)
+
+    # Empty download must NOT overwrite valid cache
+    monkeypatch.setattr(data, "_download_closes", lambda tickers: pd.DataFrame(columns=tickers))
+    got = data.load_raw(refresh=True)
+    pd.testing.assert_frame_equal(got, good)
+    pd.testing.assert_frame_equal(pd.read_pickle(raw_p), good)
+    pd.testing.assert_frame_equal(data.load_watch(["XIC.TO", "VFV.TO"], refresh=True), good[["VFV.TO", "XIC.TO"]])
+
+    # Exception must fall back to cache
+    def boom(tickers):
+        raise ConnectionError("offline")
+    monkeypatch.setattr(data, "_download_closes", boom)
+    pd.testing.assert_frame_equal(data.load_raw(refresh=True), good)
+
+    # Partial outage (VFV.TO all NaN) merges cached VFV.TO instead of wiping it
+    partial = pd.DataFrame({"XIC.TO": np.linspace(30, 36, 30), "VFV.TO": np.nan}, index=idx)
+    monkeypatch.setattr(data, "_download_closes", lambda tickers: partial)
+    merged = data.load_raw(refresh=True)
+    assert merged["VFV.TO"].notna().all() and merged["XIC.TO"].iloc[-1] == pytest.approx(36.0)
+
+
+def test_blended_ranking_prefers_smoother_uptrend():
+    from tfsa_bot.strategy import QUALITY_PARAMS
+    idx = pd.bdate_range("2024-01-01", periods=300)
+    rng = np.random.default_rng(7)
+    rets = pd.DataFrame(0.0, index=idx, columns=KEYS)
+    rets["cash"] = 0.0001
+    # Smooth uptrend vs slightly higher raw return but 10x higher noise
+    rets["gold"] = 0.0012 + rng.normal(0, 0.001, 300)
+    rets["ca_energy"] = 0.0014 + rng.normal(0, 0.03, 300)
+    tri = (1 + rets).cumprod()
+    p_raw = Params(top_n=1, hold_buffer=0, ranking="raw")
+    p_blend = Params(top_n=1, hold_buffer=0, ranking="blend", vol_window=126)
+    w_raw = target_weights(tri, p_raw)
+    w_blend = target_weights(tri, p_blend)
+    assert w_blend["gold"] == pytest.approx(1.0)  # smoother trend wins blended rank
+    assert QUALITY_PARAMS.ranking == "blend" and QUALITY_PARAMS.vol_window == 126
+
+
+def test_signal_quality_metrics_rsi_vol_flip_weeks_and_empty_guard():
+    tri = make_tri({"gold": 0.002})
+    a = signals.asset_signal(tri, tri, "gold", close=40.0)
+    assert a["ann_vol"] is not None and a["ann_vol"] > 0
+    assert a["risk_adj_score"] is not None and a["risk_adj_score"] > 0
+    assert a["rsi_14"] is not None and 50.0 < a["rsi_14"] <= 100.0
+    assert a["flip_weeks"] is not None and a["flip_weeks"] > 0
+    # Empty series must not crash
+    empty_tri = tri.copy()
+    empty_tri["gold"] = np.nan
+    e = signals.asset_signal(empty_tri, empty_tri, "gold")
+    assert e["weekly"]["state"] is None and e["rsi_14"] is None
+
+
+def test_opportunities_compare_and_shadow_quality_track(monkeypatch):
+    from tfsa_bot import data, engine, report, scan
+    from tfsa_bot.universe import BY_KEY
+    tri = make_tri({"ca_banks": 0.003, "ca_energy": 0.0025, "gold": 0.002, "us_eq": 0.0015, "bonds": -0.001}, days=400)
+    raw = tri.drop(columns="cash").rename(columns=lambda k: BY_KEY[k].ticker)
+    m = engine.Market(raw, tri.pct_change().fillna(0.0), tri, tri.index[-1])
+    monkeypatch.setattr(data, "load_watch", lambda tickers, refresh=False: pd.DataFrame(index=tri.index, columns=sorted(set(tickers))))
+
+    sc = scan.build(m, {}, held={"ca_banks"})
+    by_q = scan.select(sc["rows"], tier="model", sort="risk_adj")
+    assert all(r["tier"] == "model" for r in by_q)
+    qs = [r["risk_adj_score"] for r in by_q if r.get("risk_adj_score") is not None]
+    assert qs == sorted(qs, reverse=True)
+
+    opp = engine.opportunities_report(m, tier="model")
+    assert "strongest_uptrends" in opp and "model" in opp
+    txt = report.opportunities_text(opp)
+    assert "Opportunities —" in txt and "MODEL PORTFOLIO" in txt
+
+    comp = engine.compare_report(m, ["ZEB", "CGL-C.TO", "ZAG"])
+    assert len(comp["assets"]) == 3 and not comp["errors"]
+    assert "Comparison —" in report.compare_text(comp)
+
+    # Shadow quality track is recorded alongside core/overlay
+    engine._record_paper_tracks(m, Params(), None, None, "normal", {}, "offline", None)
+    assert len(db.decisions("quality")) == 1
+    assert sum(db.decisions("quality")[0]["weights"].values()) == pytest.approx(1.0, abs=1e-3)

@@ -18,6 +18,14 @@ def main() -> None:
     sc.add_argument("--kind", choices=["equity", "sector", "real_estate", "bond", "commodity", "crypto", "stock", "cdr", "custom"])
     sc.add_argument("--show", choices=["all", "events", "up", "down"], default="all",
                     help="events = only rows with a flip, a pending flip or close to one")
+    sc.add_argument("--tier", choices=["model", "watch"])
+    sc.add_argument("--sort", choices=["score", "risk_adj", "flip"], default="score")
+    op = sub.add_parser("opportunities", help="actionable buy/sell setups, pullbacks, early turnarounds and extended warnings")
+    op.add_argument("--kind", choices=["equity", "sector", "real_estate", "bond", "commodity", "crypto", "stock", "cdr", "custom"])
+    op.add_argument("--tier", choices=["model", "watch"])
+    op.add_argument("--limit", type=int, default=8)
+    cp = sub.add_parser("compare", help="compare multiple tickers side-by-side")
+    cp.add_argument("tickers", nargs="+")
     for name, what in (("watch", "add"), ("unwatch", "remove")):
         wp = sub.add_parser(name, help=f"{what} scan tickers (Yahoo Finance symbols); the model portfolio is unaffected")
         wp.add_argument("tickers", nargs="+")
@@ -51,7 +59,13 @@ def main() -> None:
     elif args.cmd == "scan":
         from . import engine, report, scan
         out = engine.scan_report(engine.load_market())
-        print(report.scan_text(out, scan.select(out["rows"], args.kind, args.show)))
+        print(report.scan_text(out, scan.select(out["rows"], args.kind, args.show, tier=args.tier, sort=args.sort)))
+    elif args.cmd == "opportunities":
+        from . import engine, report
+        print(report.opportunities_text(engine.opportunities_report(engine.load_market(), kind=args.kind, tier=args.tier, limit=args.limit)))
+    elif args.cmd == "compare":
+        from . import engine, report
+        print(report.compare_text(engine.compare_report(engine.load_market(), args.tickers)))
     elif args.cmd in ("watch", "unwatch"):
         from . import db, scan
         cfg = scan.edit_watchlist(db.config(), **{"add" if args.cmd == "watch" else "remove": args.tickers})

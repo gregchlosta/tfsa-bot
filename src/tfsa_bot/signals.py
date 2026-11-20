@@ -149,6 +149,22 @@ def track_record(tri: pd.DataFrame, key: str, p: Params = Params(), cost_bps: fl
     }
 
 
+def rsi(s: pd.Series, period: int = 14) -> float | None:
+    """Wilder's RSI at the last bar (0..100). Context for entry timing (overbought/oversold), never a signal."""
+    s = s.dropna()
+    if len(s) <= period:
+        return None
+    d = s.diff().dropna()
+    gain = d.clip(lower=0.0).ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    loss = (-d.clip(upper=0.0)).ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    g, l = float(gain.iloc[-1]), float(loss.iloc[-1])
+    if np.isnan(g) or np.isnan(l):
+        return None
+    if l == 0:
+        return 100.0 if g > 0 else 50.0
+    return round(100.0 - 100.0 / (1.0 + g / l), 1)
+
+
 def asset_signal(tri_w: pd.DataFrame, tri: pd.DataFrame, key: str, p: Params = Params(),
                  close: float | None = None) -> dict:
     """Everything about one asset's trend.
@@ -158,6 +174,18 @@ def asset_signal(tri_w: pd.DataFrame, tri: pd.DataFrame, key: str, p: Params = P
     flip move into a price.
     """
     a = tri[key].dropna()
+    if a.empty:
+        empty = {"as_of": tri.index[-1].date().isoformat(), "state": None, "score": None,
+                 "returns": _windows(tri[key], p), "flip_move": None}
+        return {
+            "weekly": {**empty, "since": None, "weeks": 0, "flipped": False},
+            "latest": empty,
+            "event": None, "pending": None, "near_flip": False,
+            "weekly_move": None, "ann_vol": None, "risk_adj_score": None, "rsi_14": None, "flip_weeks": None,
+            "cash_returns": _windows(tri["cash"], p),
+            "vs_200d_avg": None, "from_3y_high": None,
+            "indicators": [], "indicators_up": 0, "indicators_known": 0,
+        }
     lvl = float(a.iloc[-1])
     weekly = snapshot(tri_w, key, p)
     up = weekly_states(tri_w, key, p)
@@ -170,12 +198,22 @@ def asset_signal(tri_w: pd.DataFrame, tri: pd.DataFrame, key: str, p: Params = P
         latest["flip_price"] = round(float(close) * (1 + latest["flip_move"]), 2)
     ind = indicators(tri, key, p)
     known = [i for i in ind if i["state"]]
-    move = float(a.pct_change().iloc[-63:].std() * np.sqrt(5)) if len(a) > 20 else None
+    daily_sd = float(a.pct_change().iloc[-63:].std()) if len(a) > 20 else None
+    move = daily_sd * np.sqrt(5) if daily_sd is not None and not np.isnan(daily_sd) else None
+    ann_vol = daily_sd * np.sqrt(252) if daily_sd is not None and not np.isnan(daily_sd) else None
+    w_sc = weekly["score"]
+    ras = round(w_sc / max(ann_vol, 0.05), 3) if w_sc is not None and ann_vol is not None else None
+    fm = latest.get("flip_move")
+    flip_wks = round(abs(fm) / move, 1) if fm is not None and move and move > 1e-6 else None
     return {
         "weekly": weekly,
         "latest": latest,
         **flags(weekly, latest, move),
-        "weekly_move": None if move is None or np.isnan(move) else round(move, 4),
+        "weekly_move": None if move is None else round(move, 4),
+        "ann_vol": None if ann_vol is None else round(ann_vol, 4),
+        "risk_adj_score": ras,
+        "rsi_14": rsi(a),
+        "flip_weeks": flip_wks,
         "cash_returns": _windows(tri["cash"], p),
         "vs_200d_avg": round(lvl / float(a.iloc[-200:].mean()) - 1, 4) if len(a) >= 200 else None,
         "from_3y_high": round(lvl / float(a.iloc[-756:].max()) - 1, 4),

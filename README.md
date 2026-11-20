@@ -111,8 +111,10 @@ Notifications are macOS banners. Set `ntfy_topic` in `data/config.json` to a lon
 
 ```
 uv run tfsa-bot brief                  # full report: model portfolio, changes, 13 ETF trends, scan events, Bitcoin, stress, news
+uv run tfsa-bot opportunities          # actionable setups: model actions, fresh flips, pending flips, pullbacks, quality leaders, early turnarounds
+uv run tfsa-bot compare VFV QQC NVDA   # side-by-side comparison of any tickers (model ETFs, watchlist, CDRs, or Yahoo)
 uv run tfsa-bot scan                   # every scanned asset, best trend first, with this week's flips
-uv run tfsa-bot scan --show events     # only rows where something is happening (also --show up|down, --kind cdr|stock|sector|bond|...)
+uv run tfsa-bot scan --show events     # only rows where something is happening (also --show up|down, --kind ..., --tier model|watch, --sort score|risk_adj|flip)
 uv run tfsa-bot signal ZEB             # one asset: a model ETF, a watchlist name (CHPS, SHOP, NVDA = its CDR) or any Yahoo ticker
 uv run tfsa-bot btc                    # Bitcoin signal, flip prices, indicators, cycle clock
 uv run tfsa-bot watch BCE.TO           # add tickers to the scan; `unwatch` removes them (default entries get hidden)
@@ -127,13 +129,15 @@ uv run pytest                          # offline tests
 | Tool | What it does |
 |---|---|
 | `get_brief` | The full report; `refresh_news=True` runs a fresh news check |
-| `scan` | The scan table, filterable by `kind` and `show` |
-| `get_signal` | One asset in detail, with its track record |
-| `bitcoin_status` | Bitcoin in detail |
+| `find_opportunities` | Actionable buy/sell setups: model actions, fresh/pending flips, pullbacks in uptrends, quality leaders, early turnarounds, extended warnings |
+| `compare_assets` | Side-by-side comparison of any list of tickers in one call |
+| `scan` | The scan table, filterable by `kind`, `show`, `tier`, and sortable by `score`, `risk_adj`, or `flip` |
+| `get_signal` | One asset in detail, with RSI(14), risk-adjusted score, and its track record |
+| `bitcoin_status` | Bitcoin in detail (read-only, fast) |
 | `market_news` | Raw headlines plus the stress gauge, no AI judgement |
-| `performance` | The forward test |
-| `run_backtest` | Backtest with a chosen top N, crypto on/off, rebalance frequency and dates |
-| `update_settings` | Change `follow`, `use_llm`, `ntfy_topic`, and add/remove scan tickers (`watch` / `unwatch`) |
+| `performance` | The forward test (`core`, `overlay`, `quality`, `btc`, `btc_onchain` vs benchmarks) |
+| `run_backtest` | Backtest with a chosen `top_n`, `include_crypto`, `rebalance`, `ranking` (`raw`/`blend`), `hold_buffer`, and dates |
+| `update_settings` | Change `follow` (`core`/`overlay`/`quality`), `use_llm`, `ntfy_topic`, and add/remove scan tickers (`watch` / `unwatch`) |
 
 Try asking: *"What flipped this week?"*, *"Show me all uptrending sectors"*, *"Is NVDA a buy?"*, *"How has following the signal on gold worked historically?"*
 

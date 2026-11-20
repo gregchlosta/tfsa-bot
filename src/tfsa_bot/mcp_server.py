@@ -29,16 +29,18 @@ server = MCPServer(
         "week-end, pending = the latest close disagrees (unconfirmed), near = close to flipping. "
         "It knows nothing about the user's money, holdings or how they split it, and must never ask for "
         "them: deciding allocation and turning signals into trades is your job, together with the user, in "
-        "this chat. Start with get_brief; use scan for the whole table, get_signal for one asset and "
-        "bitcoin_status for Bitcoin. Signals change only on Friday's close. Everything else (latest-close "
-        "score, flip prices, the indicator panel, the Bitcoin cycle clock, the on-chain readings) is information for reading the "
-        "signal, not a second signal: only the trend score was backtested, and the faster indicators have "
+        "this chat. Start with get_brief or find_opportunities; use scan for the whole table, compare_assets "
+        "to compare tickers side-by-side, get_signal for one asset and bitcoin_status for Bitcoin. "
+        "Signals change only on Friday's close. Everything else (latest-close score, flip prices, RSI, "
+        "risk-adjusted score, pullback/early-turnaround setups, the indicator panel, the Bitcoin cycle clock, "
+        "the on-chain readings) is information for reading the signal, not a second signal: only the trend "
         "more false starts. Two things to say plainly when they matter. First, only the 13 model ETFs were "
         "backtested as a portfolio; the watchlist is information, and single stocks are noisier than ETFs. "
         "Second, a BUY/SELL on one asset is mainly a risk signal: each row's track record shows that "
         "following the signal on one asset alone usually halved the drawdown but returned less than "
         "holding it (Bitcoin is the exception). The backtested edge comes from holding the strongest few. "
-        "The news check is a shadow layer being forward-tested. Never invent prices: use what tools return. "
+        "The news check (overlay) and blended risk-adjusted ranking (quality) are shadow tracks being "
+        "forward-tested (see performance). Never invent prices: use what tools return. "
         "This is a rules-based system, not financial advice; present its output, its caveats and the "
         "backtest evidence (run_backtest, performance) plainly, including when the signal disagrees with "
         "what the user hopes."
@@ -51,8 +53,39 @@ def get_brief(refresh_news: bool = False) -> dict:
     """Full report: trend signal of every ETF, the strategy model portfolio and what changed since last week,
     the Bitcoin signal, stress gauge, and the latest news check. refresh_news=True pulls headlines and runs
     a new Claude assessment (~cents, ~30-60s); otherwise the latest stored assessment is reused."""
-    s = engine.run_cycle(refresh=False, with_news=refresh_news, send=False)
+    s = engine.run_cycle(refresh=False, with_news=refresh_news, send=False, log_run=False)
     return {"text": report.brief_text(s), "data": s}
+
+
+@server.tool()
+def find_opportunities(
+    kind: Literal["equity", "sector", "real_estate", "bond", "commodity", "crypto", "stock", "cdr", "custom"] | None = None,
+    tier: Literal["model", "watch"] | None = None,
+    limit: int = 8,
+) -> dict:
+    """Distill the best current buy/sell opportunities and risk warnings across the model portfolio and scan:
+    model portfolio changes & hold-buffer status, fresh confirmed BUY/SELL flips, pending mid-week flips,
+    pullbacks in confirmed uptrends (RSI <= 48), highest-quality uptrends (risk-adjusted score = score/vol),
+    early turnaround radar (fast 1/3m score already UP near a flip), and overextended/overbought warnings."""
+    try:
+        opp = engine.opportunities_report(engine.load_market(), kind=kind, tier=tier, limit=limit)
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+    return {"text": report.opportunities_text(opp), "data": opp}
+
+
+@server.tool()
+def compare_assets(tickers: list[str]) -> dict:
+    """Compare multiple assets side-by-side in one call (model ETFs, watchlist items, CDRs like 'NVDA', or
+    any Yahoo Finance ticker). Returns weekly trend, score, risk-adjusted score, RSI(14), 1/3/6/12m returns,
+    flip move/price, indicator agreement, and historical track record sorted strongest-first."""
+    if not tickers:
+        return {"error": "Provide at least one ticker to compare."}
+    try:
+        comp = engine.compare_report(engine.load_market(), tickers)
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+    return {"text": report.compare_text(comp), "data": comp}
 
 
 @server.tool()
@@ -61,8 +94,8 @@ def get_signal(ticker: str) -> dict:
     "SMH" are covered for information), a watchlist entry (e.g. "CHPS.TO", "SHOP", or a CDR such as "NVDA",
     measured on the US stock in USD), or any other Yahoo Finance ticker, which gets the same maths outside
     the backtested universe. Returns the weekly signal (UP/DOWN, since when, whether it just turned), the
-    latest-close score and the price that would flip it, 1/3/6/12-month returns vs cash, a panel of
-    independent trend indicators, and the track record of following this signal on this asset alone."""
+    latest-close score and the price that would flip it, 1/3/6/12-month returns vs cash, risk-adjusted
+    score, RSI(14), a panel of independent trend indicators, and the track record of following this signal."""
     try:
         a = engine.asset_report(engine.load_market(), ticker)
     except Exception as e:
@@ -74,18 +107,18 @@ def get_signal(ticker: str) -> dict:
 def scan(
     kind: Literal["equity", "sector", "real_estate", "bond", "commodity", "crypto", "stock", "cdr", "custom"] | None = None,
     show: Literal["all", "events", "up", "down"] = "all",
+    tier: Literal["model", "watch"] | None = None,
+    sort: Literal["score", "risk_adj", "flip"] = "score",
 ) -> dict:
     """Scan everything: the 13 model ETFs plus the watchlist (more CAD-listed ETFs, large Canadian stocks,
-    CDRs of US stocks, tickers the user added), best trend first. Each row: weekly trend and how long it
-    has held, a mark (BUY/SELL = turned this week, >UP?/>DOWN? = pending at the latest close, near = close
-    to a flip), 1/3/6/12-month returns, the move that would flip it, and the track record of following
-    that signal on that asset alone vs holding it. `events` lists this week's flips. Filter with kind, or
-    show='events' for only the rows where something is happening. Watchlist rows are information only."""
+    CDRs of US stocks, tickers the user added). Filter by kind, show ('events' = flips/pending/near), or
+    tier ('model' vs 'watch'). Sort by 'score' (default), 'risk_adj' (trend quality = score/vol), or
+    'flip' (closest to flipping in typical weekly moves). Watchlist rows are information only."""
     try:
         sc = engine.scan_report(engine.load_market())
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
-    rows = scan_mod.select(sc["rows"], kind, show)
+    rows = scan_mod.select(sc["rows"], kind, show, tier=tier, sort=sort)
     return {"text": report.scan_text(sc, rows), **{k: sc[k] for k in ("events", "counts", "stale", "note")}}
 
 
@@ -93,14 +126,15 @@ def scan(
 def bitcoin_status() -> dict:
     """Bitcoin signal in detail: weekly IN/OUT and how long it has held, the latest-close score, how far
     Bitcoin has to move to flip it (FBTC and BTC-USD prices), 1/3/6/12-month returns vs cash, the indicator
-    panel (which faster or slower indicators already agree), and the halving-cycle clock with what followed
-    the same point in earlier cycles, and on-chain readings (realized price, MVRV and its percentile in the
-    history known at the time, NUPL, Puell multiple, hash-rate trend, active addresses, what followed a
-    similar MVRV before). The signal only changes on Friday's close; the panel, the cycle clock and the
-    on-chain readings are context, not predictions. The on-chain early-entry rule is a shadow paper track
-    (see performance), backtested ahead on only two cycle bottoms: never present it as the signal."""
-    s = engine.run_cycle(refresh=False, with_news=False, send=False)
-    return {"text": report.btc_text(s["bitcoin"]), "data": s["bitcoin"]}
+    panel (which faster or slower indicators already agree), the halving-cycle clock, and on-chain readings
+    (realized price, MVRV and its percentile, NUPL, Puell multiple, hash-rate trend, active addresses).
+    The signal only changes on Friday's close; the panel, cycle clock and on-chain readings are context."""
+    m = engine.load_market()
+    cfg = db.config()
+    decs = db.decisions(cfg["follow"])
+    in_model = float(decs[-1]["weights"].get("btc", 0.0)) if decs else 0.0
+    b = engine.bitcoin_report(m, Params(), in_model=in_model)
+    return {"text": report.btc_text(b), "data": b}
 
 
 @server.tool()
@@ -125,15 +159,25 @@ def run_backtest(
     top_n: int = 4,
     include_crypto: bool = True,
     rebalance: Literal["weekly", "monthly"] = "weekly",
+    ranking: Literal["raw", "blend"] = "raw",
+    hold_buffer: int = 2,
     start: str = "2006-01-01",
     end: str | None = None,
 ) -> dict:
     """Backtest the strategy (CAD-listed universe, 10bps costs, 1-day execution lag) against XEQT-like,
-    60/40 and S&P 500 benchmarks. Takes ~10s."""
+    60/40 and S&P 500 benchmarks. ranking='blend' uses 50% raw score rank + 50% risk-adjusted (score/126d vol)
+    rank. Takes ~10s."""
     from .research import benchmarks
 
     rets = build_returns()
-    p = replace(Params(), top_n=top_n, include_crypto=include_crypto)
+    p = replace(
+        Params(),
+        top_n=top_n,
+        include_crypto=include_crypto,
+        ranking=ranking,
+        hold_buffer=hold_buffer,
+        vol_window=126 if ranking == "blend" else 63,
+    )
     rows = {"strategy": bt.run(rets, bt.strategy_fn(p), freq=rebalance, start=start, end=end).stats}
     rows.update(benchmarks(rets, start, end))
     return {k: {m: round(float(v), 4) for m, v in s.items()} for k, s in rows.items()}
@@ -141,15 +185,15 @@ def run_backtest(
 
 @server.tool()
 def update_settings(
-    follow: Literal["core", "overlay"] | None = None,
+    follow: Literal["core", "overlay", "quality"] | None = None,
     use_llm: bool | None = None,
     ntfy_topic: str | None = None,
     watch: list[str] | None = None,
     unwatch: list[str] | None = None,
 ) -> dict:
-    """Change settings. follow='overlay' makes recommendations include the news check (only once the
-    forward test supports it). watch / unwatch add or remove scan tickers (Yahoo Finance symbols, e.g.
-    "BCE.TO"); they affect the scan only, never the model portfolio."""
+    """Change settings. follow='core' (default), 'overlay' (core + news check), or 'quality' (blended
+    risk-adjusted momentum ranking). watch / unwatch add or remove scan tickers (Yahoo Finance symbols,
+    e.g. "BCE.TO"); they affect the scan only, never the model portfolio."""
     cfg = db.config()
     for k, v in {"follow": follow, "use_llm": use_llm, "ntfy_topic": ntfy_topic}.items():
         if v is not None:

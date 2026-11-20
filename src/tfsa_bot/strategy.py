@@ -25,12 +25,17 @@ class Params:
     lookbacks: tuple[int, ...] = (21, 63, 126, 252)
     top_n: int = 4
     weighting: str = "equal"  # equal | inv_vol  (equal was more robust in the grid)
+    ranking: str = "raw"  # raw | blend (50% raw score rank + 50% risk-adjusted score/vol rank)
     vol_window: int = 63
     target_vol: float | None = None  # e.g. 0.12 -> scale exposure down when risk is high
     include_crypto: bool = True
     markets: tuple[str, ...] = ("CA",)  # add "US" only with a USD account; FX fees ate the edge
     hold_buffer: int = 2  # keep a holding while it still ranks within top_n + hold_buffer
     usd_hurdle: float = 0.03  # a US-listed sleeve we don't hold must beat others by this (pays ~3% FX round trip)
+
+
+# Shadow variant: blends raw momentum rank with risk-adjusted momentum (score / 126d vol).
+QUALITY_PARAMS = Params(ranking="blend", vol_window=126)
 
 
 def scores(tri: pd.DataFrame, p: Params) -> pd.Series:
@@ -77,7 +82,14 @@ def target_weights(
         if BY_KEY[k].usd and k not in held:
             sc[k] -= p.usd_hurdle
 
-    ranked = list(sc[sc > 0].sort_values(ascending=False).index)
+    pos = sc[sc > 0]
+    if p.ranking == "blend" and len(pos) > 1:
+        vol = (tri[pos.index].pct_change().iloc[-p.vol_window :].std() * np.sqrt(252)).clip(lower=0.05)
+        sharpe = pos / vol
+        order = (0.5 * pos.rank(pct=True) + 0.5 * sharpe.rank(pct=True)).sort_values(ascending=False)
+        ranked = list(order.index)
+    else:
+        ranked = list(pos.sort_values(ascending=False).index)
     chosen = [k for k in ranked[: p.top_n + p.hold_buffer] if k in held][: p.top_n]
     for k in ranked:
         if len(chosen) >= p.top_n:

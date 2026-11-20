@@ -10,7 +10,7 @@ import pandas as pd
 from . import backtest as bt
 from . import btc, onchain, signals
 from .data import build_returns, total_return_index
-from .strategy import Params, scores, target_weights, universe_keys
+from .strategy import QUALITY_PARAMS, Params, scores, target_weights, universe_keys
 from .universe import BY_KEY
 
 START = "2006-01-01"  # leaves 1y warm-up after data starts (late 2004)
@@ -339,6 +339,19 @@ def main() -> None:
 
     print("\n=== 11. On-chain readings vs the Bitcoin signal (Bitcoin or cash, weekly, from 2015-09) ===")
     onchain_study(rets)
+
+    print("\n=== 12. Blended risk-adjusted ranking (QUALITY_PARAMS: 50% raw rank + 50% score/126d-vol rank) ===")
+    rows = {}
+    for label, p_raw, p_bl in (
+        ("full (with crypto)", base, QUALITY_PARAMS),
+        ("no crypto", replace(base, include_crypto=False), replace(QUALITY_PARAMS, include_crypto=False)),
+    ):
+        for tag, a, b in (("full", START, None), ("06-15", START, "2015-12-31"), ("16-now", "2016-01-01", None)):
+            rows[f"{label} {tag} raw"] = bt.run(rets, bt.strategy_fn(p_raw), start=a, end=b).stats
+            rows[f"{label} {tag} blend"] = bt.run(rets, bt.strategy_fn(p_bl), start=a, end=b).stats
+    print(table(rows))
+    print("Blended ranking beats raw momentum in both halves and without crypto, with slightly lower drawdown and\n"
+          "turnover. It is paper-traded as the shadow `quality` track before replacing `core`.")
 
 
 if __name__ == "__main__":

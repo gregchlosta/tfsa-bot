@@ -53,7 +53,7 @@ def current_weights(rets: pd.DataFrame, track: str) -> pd.Series | None:
 def report(rets: pd.DataFrame) -> dict:
     out = {}
     curves = {}
-    for track in ("core", "overlay"):
+    for track in ("core", "overlay", "quality"):
         eq, w = replay(rets, db.decisions(track))
         if len(eq):
             curves[track] = eq

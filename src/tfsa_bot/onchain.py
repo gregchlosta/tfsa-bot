@@ -21,7 +21,7 @@ import urllib.request
 import numpy as np
 import pandas as pd
 
-from .data import DATA_DIR, _fresh
+from .data import DATA_DIR, _fresh, _read_cache, _write_pickle
 
 URL = "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics"
 METRICS = ("PriceUSD", "CapMrktCurUSD", "CapMVRVCur", "IssTotUSD", "HashRate", "AdrActCnt")
@@ -47,11 +47,20 @@ def fetch() -> pd.DataFrame:
 
 
 def load(refresh: bool = False) -> pd.DataFrame:
-    if not refresh and _fresh(CACHE):
-        return pd.read_pickle(CACHE)
-    df = fetch()
-    DATA_DIR.mkdir(exist_ok=True)
-    df.to_pickle(CACHE)
+    old = _read_cache(CACHE)
+    if not refresh and _fresh(CACHE) and old is not None and not old.empty:
+        return old
+    try:
+        df = fetch()
+    except Exception:
+        if old is not None and not old.empty:
+            return old
+        raise
+    if df.empty:
+        if old is not None and not old.empty:
+            return old
+        raise RuntimeError("CoinMetrics returned empty on-chain dataset")
+    _write_pickle(df, CACHE)
     return df
 
 

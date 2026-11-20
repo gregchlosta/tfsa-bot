@@ -145,6 +145,18 @@ def signal_lines(a: dict) -> list[str]:
     L.append("  Returns 1/3/6/12m: " + ", ".join(pct(v) for v in n["returns"].values())
              + "  (cash: " + ", ".join(pct(v) for v in a["cash_returns"].values()) + ")")
     L.append(f"  vs 200-day average {pct(a['vs_200d_avg'])}, from 3-year high {pct(a['from_3y_high'])}")
+    extras = []
+    if a.get("risk_adj_score") is not None:
+        extras.append(f"risk-adj score {a['risk_adj_score']:+.2f}")
+    if a.get("ann_vol") is not None:
+        extras.append(f"vol {a['ann_vol']:.0%}")
+    if a.get("rsi_14") is not None:
+        tag = " (stretched)" if a["rsi_14"] >= 75 else " (oversold)" if a["rsi_14"] <= 35 else ""
+        extras.append(f"RSI(14) {a['rsi_14']:.0f}{tag}")
+    if a.get("flip_weeks") is not None:
+        extras.append(f"~{a['flip_weeks']:.1f} typical wks to flip")
+    if extras:
+        L.append("  Quality & timing (context): " + ", ".join(extras))
     L.append(f"  Indicators at the latest close ({a['indicators_up']} of {a['indicators_known']} up; only the first is the signal):")
     for i in a["indicators"]:
         L.append(f"    {INDICATOR_LABELS[i['name']]:22s} {i['state'] or 'n/a':5s} {_flip(i['flip_move']):20s} {ROLE_NOTES[i['role']]}")
@@ -180,8 +192,9 @@ def signal_text(a: dict) -> str:
 def btc_text(b: dict) -> str:
     w, n = b["weekly"], b["latest"]
     was = f", was {b['previous_week']} last week" if b["previous_week"] and b["previous_week"] != b["signal"] else ""
+    sc_txt = "n/a" if w["score"] is None else f"{w['score']:+.3f}"
     L = [f"BITCOIN TREND SIGNAL: {b['signal']} ({'hold FBTC.TO' if b['signal'] == 'IN' else 'out, cash'}{was}) "
-         f"— weekly score {w['score']:+.3f}, {w['state']} since {w['since']} ({_weeks(w['weeks'])})"]
+         f"— weekly score {sc_txt}, {w['state'] or 'n/a'} since {w['since'] or 'n/a'} ({_weeks(w['weeks'])})"]
     if b["in_model_portfolio"]:
         L.append(f"  The strategy model portfolio also holds FBTC at {b['in_model_portfolio']:.0%} (cap 15%).")
     L += signal_lines({**b, "ticker": "FBTC"})
@@ -269,4 +282,70 @@ def scan_text(sc: dict, rows: list[dict] | None = None) -> str:
                  f"{record_text(r['record']):42s} {tag:7s} {r['kind']:11s} {r['name']}")
     if sc.get("stale"):
         L.append("\nStale prices: " + "; ".join(f"{t} ({_stale(v)})" for t, v in sc["stale"].items()))
+    return "\n".join(L)
+
+
+def _opp_row(r: dict) -> str:
+    tag = "[held]" if r.get("in_model") else "[model]" if r["tier"] == "model" else ""
+    ras = f"q={r['risk_adj_score']:+.2f}" if r.get("risk_adj_score") is not None else "q=n/a"
+    rsi = f"RSI {r['rsi_14']:2.0f}" if r.get("rsi_14") is not None else "RSI --"
+    fw = f"{r['flip_weeks']:.1f}w" if r.get("flip_weeks") is not None else ""
+    fp = f" (${r['flip_price']})" if r.get("flip_price") is not None else ""
+    rec = record_text(r.get("record"))
+    return (f"  {r['ticker']:10s} {r['score']:+.3f} {ras:8s} {rsi:6s}  flip {pct(r['flip_move'], 0):>4s}{fp:10s} {fw:5s} "
+            f"{r['indicators']:3s}  {rec:42s} {tag:7s} {r['name']}")
+
+
+def opportunities_text(opp: dict) -> str:
+    """Render actionable buy/sell opportunities from scan.opportunities + model status."""
+    c = opp["counts"]
+    L = [f"Opportunities — data as of {opp['data_as_of']} close (weekly signal from {opp['signal_week']}); "
+         f"{c['scanned']} scanned ({c['up']} UP, {c['down']} DOWN)"]
+    mod = opp.get("model")
+    if mod:
+        L.append(f"\nMODEL PORTFOLIO ({mod['follow']}): "
+                 + ", ".join(f"{t} {w:.1%}".replace(".0%", "%") for t, w in mod["portfolio"].items()))
+        if mod.get("changes"):
+            L.append("  This week's model changes: " + "; ".join(change_text(ch) for ch in mod["changes"]))
+        else:
+            L.append("  No model portfolio changes this week.")
+        if mod.get("held_by_buffer") or mod.get("next_in_line"):
+            L.append(f"  Buffer: kept={', '.join(mod['held_by_buffer']) or 'none'}; "
+                     f"next in line={', '.join(mod['next_in_line']) or 'none'}")
+
+    sections = [
+        ("fresh_buys", "FRESH CONFIRMED BUYS (turned UP at last week-end)"),
+        ("fresh_sells", "FRESH CONFIRMED SELLS (turned DOWN at last week-end)"),
+        ("pending_up", "PENDING BUYS (latest close > UP, awaiting Friday close)"),
+        ("pending_down", "PENDING SELLS (latest close > DOWN, awaiting Friday close)"),
+        ("pullback_setups", "PULLBACKS IN CONFIRMED UPTRENDS (UP, 4+/5 indicators, RSI <= 48; timing context)"),
+        ("strongest_uptrends", "HIGHEST-QUALITY UPTRENDS (ranked by risk-adjusted score q = score/vol)"),
+        ("early_turnarounds", "EARLY TURNAROUND RADAR (DOWN, fast 1/3m score UP, within 2.5 wks of flipping)"),
+        ("extended_warnings", "EXTENDED / OVERBOUGHT UPTRENDS (RSI >= 75 or >35% above 200d; chasing risk)"),
+    ]
+    for key, title in sections:
+        items = opp.get(key) or []
+        if items:
+            L.append(f"\n{title}:")
+            for r in items:
+                L.append(_opp_row(r))
+    L.append(f"\nNote: {opp['note']}")
+    return "\n".join(L)
+
+
+def compare_text(comp: dict) -> str:
+    """Side-by-side comparison table of requested assets."""
+    L = [f"Comparison — data as of {comp['data_as_of']} close (weekly signal from {comp['signal_week']}):"]
+    for a in comp["assets"]:
+        w, n = a["weekly"], a["latest"]
+        sc = "n/a" if w["score"] is None else f"{w['score']:+.3f}"
+        ras = f"q={a['risk_adj_score']:+.2f}" if a.get("risk_adj_score") is not None else "q=n/a"
+        rsi = f"RSI {a['rsi_14']:2.0f}" if a.get("rsi_14") is not None else "RSI --"
+        r = w["returns"]
+        L.append(f"  {a['ticker']:10s} {sc:>6s} {w['state'] or 'n/a':4s} {w['weeks']:3d}w  {ras:8s} {rsi:6s}  "
+                 f"1m {pct(r['21d']):>6s} 3m {pct(r['63d']):>6s} 6m {pct(r['126d']):>6s} 12m {pct(r['252d']):>7s}  "
+                 f"flip {pct(n['flip_move'], 0):>4s}  {a['indicators_up']}/{a['indicators_known']}  "
+                 f"{record_text(a.get('record')):42s} {a['name']}")
+    for q, err in (comp.get("errors") or {}).items():
+        L.append(f"  {q}: ERROR ({err})")
     return "\n".join(L)

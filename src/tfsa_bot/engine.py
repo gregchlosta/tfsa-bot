@@ -24,7 +24,7 @@ from . import backtest as bt
 from . import btc, data, db, news, notify, onchain, overlay, paper, scan, signals
 from . import stress as stress_mod
 from .report import change_text
-from .strategy import Params, scores, target_weights, universe_keys
+from .strategy import QUALITY_PARAMS, Params, scores, target_weights, universe_keys
 from .universe import BY_KEY, CASH, SLEEVES, STRESS_TICKERS, Sleeve, Watch
 
 NEWS_MAX_AGE_H = 72
@@ -86,7 +86,13 @@ def _w(s: pd.Series | None) -> dict:
     return {} if s is None else {k: round(float(v), 4) for k, v in s.items() if v > 1e-4}
 
 
-def run_cycle(refresh: bool = True, with_news: bool = True, use_llm: bool | None = None, send: bool = True) -> dict:
+def run_cycle(
+    refresh: bool = True,
+    with_news: bool = True,
+    use_llm: bool | None = None,
+    send: bool = True,
+    log_run: bool = True,
+) -> dict:
     cfg = db.config()
     p = Params()
     m = load_market(refresh)
@@ -94,6 +100,7 @@ def run_cycle(refresh: bool = True, with_news: bool = True, use_llm: bool | None
 
     core_pw = paper.current_weights(m.rets, "core")
     ov_pw = paper.current_weights(m.rets, "overlay")
+    qual_pw = paper.current_weights(m.rets, "quality")
     stress = stress_mod.snapshot(m.raw, m.rets.index)
     ranking = scores(m.tri_w[universe_keys(p) + ["cash"]], p).sort_values(ascending=False)
     core_now = target_weights(m.tri_w, p, core_pw)
@@ -124,7 +131,7 @@ def run_cycle(refresh: bool = True, with_news: bool = True, use_llm: bool | None
     flags = {f["sleeve"]: f["action"] for f in view["flags"]} if view else {}
 
     chain = onchain_features(refresh)
-    new_week, btc_new_week = _record_paper_tracks(m, p, core_pw, ov_pw, risk, flags, chain)
+    new_week, btc_new_week = _record_paper_tracks(m, p, core_pw, ov_pw, risk, flags, chain, qual_pw)
 
     # --- the model portfolio: latest decision of the followed track ----------
     decs = db.decisions(cfg["follow"])
@@ -155,7 +162,8 @@ def run_cycle(refresh: bool = True, with_news: bool = True, use_llm: bool | None
         "changes_since": decs[-2]["as_of"] if len(decs) > 1 else None,
         "bitcoin": bitcoin_report(m, p, btc_new_week, float(rec.get("btc", 0.0)), chain),
     }
-    db.save_run(summary)
+    if log_run:
+        db.save_run(summary)
     if send:
         _maybe_notify(summary, prev_llm)
     return summary
@@ -167,6 +175,52 @@ def scan_report(m: Market, p: Params = Params(), refresh: bool = False) -> dict:
     decs = db.decisions(cfg["follow"])
     held = {k for k, v in decs[-1]["weights"].items() if k != "cash" and v > 1e-4} if decs else set()
     return scan.build(m, cfg, p, refresh, held)
+
+
+def opportunities_report(
+    m: Market,
+    kind: str | None = None,
+    tier: str | None = None,
+    limit: int = 8,
+    p: Params = Params(),
+) -> dict:
+    """Actionable buy/sell opportunities from the model portfolio and the wider scan. Read-only."""
+    cfg = db.config()
+    decs = db.decisions(cfg["follow"])
+    rec = pd.Series(decs[-1]["weights"], dtype=float) if decs else target_weights(m.tri_w, p)
+    prev = pd.Series(decs[-2]["weights"], dtype=float) if len(decs) > 1 else None
+    held = {k for k, v in rec.items() if k != "cash" and v > 1e-4}
+    sc = scan.build(m, cfg, p, False, held)
+    opp = scan.opportunities(sc, kind=kind, tier=tier, limit=limit)
+    ranking = scores(m.tri_w[universe_keys(p) + ["cash"]], p).sort_values(ascending=False)
+    trends = market_trends(m, ranking, rec, p)
+    opp["model"] = {
+        "follow": cfg["follow"],
+        "portfolio": {BY_KEY[k].ticker: v for k, v in _w(rec).items()},
+        "changes": None if prev is None else signals.signal_changes(prev, rec),
+        "changes_since": decs[-2]["as_of"] if len(decs) > 1 else None,
+        "held_by_buffer": [t["ticker"] for t in trends if t.get("model_status") == "held_by_buffer"],
+        "next_in_line": [t["ticker"] for t in trends if t.get("model_status") == "next_in_line"],
+    }
+    return opp
+
+
+def compare_report(m: Market, tickers: list[str], p: Params = Params()) -> dict:
+    """Side-by-side signal comparison for a list of tickers (model ETFs, watchlist, CDRs, or Yahoo). Read-only."""
+    rows, errors = [], {}
+    for q in tickers:
+        try:
+            a = asset_report(m, q, p)
+            rows.append(a)
+        except Exception as e:
+            errors[q] = f"{type(e).__name__}: {e}"
+    rows.sort(key=lambda r: (r["weekly"]["score"] is None, -(r["weekly"]["score"] or 0.0)))
+    return {
+        "data_as_of": m.as_of.date().isoformat(),
+        "signal_week": m.week.date().isoformat(),
+        "assets": rows,
+        "errors": errors,
+    }
 
 
 def data_warnings(m: Market, p: Params) -> list[dict]:
@@ -186,7 +240,8 @@ def onchain_features(refresh: bool = False) -> pd.DataFrame | str:
 
 def _record_paper_tracks(m: Market, p: Params, core_pw: pd.Series | None, ov_pw: pd.Series | None,
                          risk: str, flags: dict[str, str],
-                         chain: pd.DataFrame | str | None = None) -> tuple[bool, bool]:
+                         chain: pd.DataFrame | str | None = None,
+                         qual_pw: pd.Series | None = None) -> tuple[bool, bool]:
     """Forward test. Returns (core/overlay decision recorded now, Bitcoin decision recorded now)."""
     week_s = m.week.date().isoformat()
     new_week = not any(d["as_of"] == week_s for d in db.decisions("core"))
@@ -205,6 +260,9 @@ def _record_paper_tracks(m: Market, p: Params, core_pw: pd.Series | None, ov_pw:
                 w[k] = core_week.get(k, 0) / 2
             w["cash"] = 1 - w.drop("cash").sum()
             db.save_decision("overlay", m.as_of.date().isoformat(), _w(w), [f"{k}: mid-week cut (news)" for k in cut])
+
+    if not any(d["as_of"] == week_s for d in db.decisions("quality")):
+        db.save_decision("quality", week_s, _w(target_weights(m.tri_w, QUALITY_PARAMS, qual_pw)))
 
     btc_new_week = not any(d["as_of"] == week_s for d in db.decisions("btc"))
     if btc_new_week:

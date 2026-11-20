@@ -1,6 +1,7 @@
 """Download prices and build one CAD total-return index per sleeve, on the TSX calendar."""
 
 import io
+import os
 import time
 import urllib.request
 from datetime import datetime
@@ -46,31 +47,90 @@ def _all_tickers() -> list[str]:
     return sorted(t)
 
 
-def load_raw(refresh: bool = False) -> pd.DataFrame:
-    """Adjusted (dividend-inclusive) closes for every ticker we need, cached on disk."""
-    if not refresh and _fresh(RAW_CACHE):
-        return pd.read_pickle(RAW_CACHE)
+def _write_pickle(obj, path: Path) -> None:
+    """Atomic pickle write so a crashed/killed process never leaves a truncated cache."""
     DATA_DIR.mkdir(exist_ok=True)
-    df = yf.download(_all_tickers(), start="2000-01-01", auto_adjust=True, progress=False)["Close"]
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    obj.to_pickle(tmp)
+    os.replace(tmp, path)
+
+
+def _read_cache(path: Path):
+    if not path.exists():
+        return None
+    try:
+        return pd.read_pickle(path)
+    except Exception:
+        return None
+
+
+def _merge_fallback(fresh: pd.DataFrame, old: pd.DataFrame | None, want: list[str]) -> pd.DataFrame:
+    """Keep fresh non-empty columns; for any ticker Yahoo failed to return, preserve the cached column
+    so `stale()` can flag it instead of wiping out its history."""
+    out = fresh.reindex(columns=want)
+    if old is None or old.empty:
+        return out
+    missing = [c for c in want if c in old.columns and out[c].dropna().empty and old[c].notna().any()]
+    if missing:
+        idx = out.index.union(old.index)
+        out = out.reindex(idx)
+        for c in missing:
+            out[c] = old[c].reindex(idx)
+    return out
+
+
+def _download_closes(tickers: list[str]) -> pd.DataFrame:
+    df = yf.download(tickers, start="2000-01-01", auto_adjust=True, progress=False)["Close"]
+    if isinstance(df, pd.Series):
+        df = df.to_frame(name=tickers[0])
     df.index = pd.to_datetime(df.index).tz_localize(None)
-    df.to_pickle(RAW_CACHE)
+    return df
+
+
+def load_raw(refresh: bool = False) -> pd.DataFrame:
+    """Adjusted (dividend-inclusive) closes for every ticker we need, cached on disk.
+    Never overwrites a valid cache with an empty/failed download; falls back to cache on outage."""
+    old = _read_cache(RAW_CACHE)
+    if not refresh and _fresh(RAW_CACHE) and old is not None and not old.empty and "XIC.TO" in old and old["XIC.TO"].notna().any():
+        return old
+    want = _all_tickers()
+    try:
+        df = _download_closes(want)
+    except Exception:
+        if old is not None and not old.empty:
+            return old
+        raise
+    if df.empty or "XIC.TO" not in df or df["XIC.TO"].dropna().empty:
+        if old is not None and not old.empty and "XIC.TO" in old and old["XIC.TO"].notna().any():
+            return old
+        raise RuntimeError("Yahoo Finance returned no price data for core universe (XIC.TO missing)")
+    df = _merge_fallback(df, old, want)
+    _write_pickle(df, RAW_CACHE)
     return df
 
 
 def load_watch(tickers: list[str], refresh: bool = False) -> pd.DataFrame:
-    """Adjusted closes for the watchlist, cached on disk. A ticker Yahoo doesn't know is an empty column."""
+    """Adjusted closes for the watchlist, cached on disk. A ticker Yahoo doesn't know is an empty column.
+    Never overwrites a valid cache with an empty/failed download."""
     want = sorted(set(tickers))
     if not want:
         return pd.DataFrame()
-    if not refresh and _fresh(WATCH_CACHE):
-        df = pd.read_pickle(WATCH_CACHE)
-        if set(want) <= set(df.columns):
-            return df[want]
-    DATA_DIR.mkdir(exist_ok=True)
-    df = yf.download(want, start="2000-01-01", auto_adjust=True, progress=False)["Close"]
-    df.index = pd.to_datetime(df.index).tz_localize(None)
-    df = df.reindex(columns=want)
-    df.to_pickle(WATCH_CACHE)
+    old = _read_cache(WATCH_CACHE)
+    if not refresh and _fresh(WATCH_CACHE) and old is not None and not old.empty:
+        if set(want) <= set(old.columns):
+            return old[want]
+    try:
+        df = _download_closes(want)
+    except Exception:
+        if old is not None and not old.empty:
+            return old.reindex(columns=want)
+        raise
+    if df.empty or not df.notna().any().any():
+        if old is not None and not old.empty:
+            return old.reindex(columns=want)
+        return pd.DataFrame(columns=want)
+    df = _merge_fallback(df, old, want)
+    _write_pickle(df, WATCH_CACHE)
     return df
 
 
@@ -111,16 +171,25 @@ def load_ticker(ticker: str) -> pd.Series:
 
 
 def load_cad_tbill(refresh: bool = False) -> pd.Series:
-    """Canadian 3-month T-bill yield (annual %, monthly) from FRED."""
-    if not refresh and _fresh(CASH_CACHE):
-        return pd.read_pickle(CASH_CACHE)
+    """Canadian 3-month T-bill yield (annual %, monthly) from FRED. Falls back to cache on outage."""
+    old = _read_cache(CASH_CACHE)
+    if not refresh and _fresh(CASH_CACHE) and old is not None and len(old):
+        return old
     sid = CASH.proxy.split(":", 1)[1]
     url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}"
-    with urllib.request.urlopen(url, timeout=30) as r:
-        s = pd.read_csv(io.BytesIO(r.read()), index_col=0, parse_dates=True).iloc[:, 0]
-    s = pd.to_numeric(s, errors="coerce").dropna()
-    DATA_DIR.mkdir(exist_ok=True)
-    s.to_pickle(CASH_CACHE)
+    try:
+        with urllib.request.urlopen(url, timeout=30) as r:
+            s = pd.read_csv(io.BytesIO(r.read()), index_col=0, parse_dates=True).iloc[:, 0]
+        s = pd.to_numeric(s, errors="coerce").dropna()
+    except Exception:
+        if old is not None and len(old):
+            return old
+        raise
+    if s.empty:
+        if old is not None and len(old):
+            return old
+        raise RuntimeError("FRED returned empty T-bill series")
+    _write_pickle(s, CASH_CACHE)
     return s
 
 
