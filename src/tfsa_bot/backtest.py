@@ -46,13 +46,18 @@ def run(
     band: float = 0.05,
     start: str | None = None,
     end: str | None = None,
+    invest_at_start: bool = False,
 ) -> Result:
     tri = total_return_index(rets)
     r = rets.fillna(0.0)
     idx = rets.index
-    reb = set(rebalance_dates(idx, freq))
     first_ok = idx[0] if start is None else idx[idx >= pd.Timestamp(start)][0]
     last_ok = idx[-1] if end is None else idx[idx <= pd.Timestamp(end)][-1]
+    reb = set(rebalance_dates(idx, freq))
+    if invest_at_start:
+        # Otherwise a run sits in cash until its first rebalance date: up to a quarter for the quarterly
+        # benchmarks, which made the forward-test benchmark read +0.1% during a correction (Nov 2026).
+        reb.add(first_ok)
 
     cols = list(rets.columns)
     cost = pd.Series(

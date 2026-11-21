@@ -197,6 +197,22 @@ def test_btc_status_adds_usd_flip_price_and_cycle():
     assert s["weekly"]["state"] == "UP"
     assert s["latest"]["flip_price_btc_usd"] == pytest.approx(100_000 * (1 + s["latest"]["flip_move"]), abs=50)
     assert s["cycle"]["last_halving"] == "2024-04-20"  # make_tri ends in early 2025
+    from tfsa_bot import report
+    line = next(x for x in report.signal_lines(s) if x.startswith("  Latest close"))
+    # the flip level is labelled as such and the current price is shown next to it
+    assert f"at Bitcoin ≈ US${s['latest']['flip_price_btc_usd']:,.0f}, now US$100,000" in line
+
+
+def test_benchmark_is_invested_from_the_start_date():
+    """A quarterly benchmark started mid-quarter must not sit in cash until the quarter-end."""
+    from tfsa_bot import backtest as bt
+    idx = pd.bdate_range("2026-01-01", "2026-12-31")
+    rets = pd.DataFrame(0.0, index=idx, columns=KEYS)
+    rets["cash"] = 0.0001
+    rets.loc["2026-11-02":, ["ca_eq", "us_eq", "intl", "em"]] = -0.01  # a correction after Oct 30
+    eq = bt.run(rets, bt.fixed(bt.XEQT_LIKE), freq="quarterly", start="2026-10-30", end="2026-11-20",
+                invest_at_start=True).equity
+    assert eq.iloc[-1] / eq.iloc[0] - 1 < -0.10  # falls with the market, not +cash interest
 
 
 def test_btc_cycle_clock_compares_same_day_count_in_earlier_cycles():

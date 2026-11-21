@@ -138,10 +138,14 @@ def signal_lines(a: dict) -> list[str]:
     n = a["latest"]
     L = []
     if n["state"]:
-        at = (f" ({a.get('price_ticker') or a.get('ticker', 'price')} ≈ ${n['flip_price']}, last close ${n['close']})"
-              if n.get("flip_price") else "")
-        usd = f"; Bitcoin ≈ US${n['flip_price_btc_usd']:,.0f}" if n.get("flip_price_btc_usd") else ""
-        L.append(f"  Latest close {n['as_of']}: score {n['score']:+.3f} -> {n['state']}. {_flip(n['flip_move']).capitalize()}{at}{usd}.")
+        # Flip prices next to the latest price, so a flip level is never read as the current price.
+        where = []
+        if n.get("flip_price"):
+            where.append(f"at {a.get('price_ticker') or a.get('ticker', 'price')} ≈ ${n['flip_price']}, last close ${n['close']}")
+        if n.get("flip_price_btc_usd"):
+            where.append(f"at Bitcoin ≈ US${n['flip_price_btc_usd']:,.0f}, now US${n['btc_usd']:,.0f}")
+        at = f" ({'; '.join(where)})" if where else ""
+        L.append(f"  Latest close {n['as_of']}: score {n['score']:+.3f} -> {n['state']}. {_flip(n['flip_move']).capitalize()}{at}.")
     L.append("  Returns 1/3/6/12m: " + ", ".join(pct(v) for v in n["returns"].values())
              + "  (cash: " + ", ".join(pct(v) for v in a["cash_returns"].values()) + ")")
     L.append(f"  vs 200-day average {pct(a['vs_200d_avg'])}, from 3-year high {pct(a['from_3y_high'])}")

@@ -30,7 +30,7 @@ def table(rows: dict[str, dict]) -> str:
 
 
 def benchmarks(rets, start=START, end=None) -> dict[str, dict]:
-    kw = dict(freq="quarterly", start=start, end=end)
+    kw = dict(freq="quarterly", start=start, end=end, invest_at_start=True)
     return {
         "BENCH XEQT-like (100% equity)": bt.run(rets, bt.fixed(bt.XEQT_LIKE), **kw).stats,
         "BENCH XBAL-like (60/40)": bt.run(rets, bt.fixed(bt.XBAL_LIKE), **kw).stats,
@@ -297,7 +297,7 @@ def main() -> None:
 
     print("=== 5. Calendar-year returns ===")
     res = bt.run(rets, bt.strategy_fn(base), start=START)
-    bench = bt.run(rets, bt.fixed(bt.XEQT_LIKE), freq="quarterly", start=START)
+    bench = bt.run(rets, bt.fixed(bt.XEQT_LIKE), freq="quarterly", start=START, invest_at_start=True)
     yr = pd.DataFrame({
         "strategy": res.equity.resample("YE").last().pct_change(),
         "XEQT-like": bench.equity.resample("YE").last().pct_change(),

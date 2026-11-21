@@ -37,6 +37,7 @@ Beat buy-and-hold (XEQT/VFV) after costs, with smaller drawdowns, using ONE simp
 - Notifications are sent by scheduled runs only. What has been announced is kept in the `state` table (`notified_week`, `btc_heads_up`), not inferred from the run log, because reports opened from the app or the CLI log runs too.
 - `data.stale` flags tickers whose last price is 2+ trading days old (prices are forward-filled for 5 days, so a dead ticker would otherwise look flat). One day of lag is normal: US and Canadian holidays differ.
 - Backtest and paper replay share execution rules: decide at the close, execute at the next close, 10 bps per leg.
+- Fixed-weight benchmarks run with `invest_at_start=True` (decide on the first day too). Without it a quarterly benchmark sat in cash until the quarter-end, which made the forward-test XEQT-like read +0.1% during the Nov 2026 correction. Strategy runs keep their weekly calendar, because moving the first pick shifts the path through the hold buffer (about ±0.2% CAGR of noise).
 - Signals use completed daily closes only (`engine.completed_returns` drops today's partial bar).
 - Canadian ETF history is spliced with US proxies converted to CAD (`data.py`); proxies carry an annual drag for MER and withholding tax.
 - State lives in `data/` (git-ignored): `tfsa.db` (decisions, assessments, runs), `config.json`, price caches.

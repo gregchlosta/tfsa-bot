@@ -62,7 +62,8 @@ def report(rets: pd.DataFrame) -> dict:
                           "holding": {k: round(v, 3) for k, v in w.items() if v > 1e-4}}
     if curves:
         start = min(c.index[0] for c in curves.values())
-        b = bt.run(rets, bt.fixed(bt.XEQT_LIKE), freq="quarterly", start=str(start.date())).equity
+        b = bt.run(rets, bt.fixed(bt.XEQT_LIKE), freq="quarterly", start=str(start.date()),
+                   invest_at_start=True).equity
         out["bench_xeqt_like"] = {"since": str(start.date()), "return": round(b.iloc[-1] / b.iloc[0] - 1, 4)}
     eq, w = replay(rets, db.decisions("btc"))
     if len(eq):
